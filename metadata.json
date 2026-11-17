@@ -1,0 +1,6 @@
+{
+  "name": "声迹工坊 · 本地音视频语音转文字",
+  "description": "纯本地离线音视频语音转文字与批量字幕生成工作台，无需联网上传，保护用户隐私，支持导出 SRT 字幕与 TXT 文本。",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
