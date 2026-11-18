@@ -345,15 +345,33 @@ export const TranscriptInspector: React.FC<TranscriptInspectorProps> = ({
                 }}
               />
             </div>
-            {item.streamingText && (
-              <div className="pt-2">
+            {item.chunks.length > 0 ? (
+              <div className="space-y-1.5 pt-2">
                 <p className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                  实时识别片段流：
+                  已识别字幕片段（实时更新中）：
                 </p>
-                <p className="mt-1 rounded-md bg-slate-50 p-3 text-xs leading-relaxed text-slate-700 dark:bg-slate-800 dark:text-slate-300">
-                  {item.streamingText}
-                </p>
+                <div className="max-h-64 space-y-1.5 overflow-y-auto rounded-md bg-slate-50 p-3 dark:bg-slate-800/60">
+                  {item.chunks.map((ch) => (
+                    <div key={ch.id} className="flex items-start gap-2 text-xs">
+                      <span className="shrink-0 font-mono text-[11px] tabular-nums text-blue-700 dark:text-blue-400">
+                        {formatSrtTimestamp(ch.start).slice(0, 8)}
+                      </span>
+                      <span className="text-slate-800 dark:text-slate-200">{ch.text}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
+            ) : (
+              item.streamingText && (
+                <div className="pt-2">
+                  <p className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                    实时处理状态：
+                  </p>
+                  <p className="mt-1 rounded-md bg-slate-50 p-3 text-xs leading-relaxed text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                    {item.streamingText}
+                  </p>
+                </div>
+              )
             )}
           </div>
         )}

@@ -48,11 +48,12 @@ export function detectMediaKind(file: File): 'audio' | 'video' {
   return VIDEO_EXTENSIONS.has(ext) ? 'video' : 'audio';
 }
 
-export function probeMediaDuration(file: File): Promise<number> {
+export function probeMediaDurationFromUrl(
+  objectUrl: string,
+  kind: 'audio' | 'video'
+): Promise<number> {
   return new Promise((resolve) => {
-    const kind = detectMediaKind(file);
     const element = document.createElement(kind === 'video' ? 'video' : 'audio');
-    const url = URL.createObjectURL(file);
     let settled = false;
 
     const cleanup = () => {
@@ -60,7 +61,6 @@ export function probeMediaDuration(file: File): Promise<number> {
       settled = true;
       element.removeAttribute('src');
       element.load();
-      URL.revokeObjectURL(url);
     };
 
     const timer = window.setTimeout(() => {
@@ -80,7 +80,7 @@ export function probeMediaDuration(file: File): Promise<number> {
       cleanup();
       resolve(0);
     };
-    element.src = url;
+    element.src = objectUrl;
   });
 }
 
@@ -95,7 +95,24 @@ export interface DecodedAudioResult {
  * and resamples its audio track to 16kHz mono Float32Array for Whisper inference.
  */
 export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResult> {
-  const arrayBuffer = await file.arrayBuffer();
+  let arrayBuffer: ArrayBuffer;
+  try {
+    arrayBuffer = await file.arrayBuffer();
+  } catch (err) {
+    const name = err instanceof Error ? err.name : '';
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      name === 'NotReadableError' ||
+      msg.toLowerCase().includes('permission') ||
+      msg.toLowerCase().includes('could not be read')
+    ) {
+      throw new Error(
+        '文件读取失败（权限失效或文件过大超出浏览器单次读取上限）。请确保文件位于本地硬盘且未被占用，大视频建议先提取 MP3/WAV 音轨或分段处理，然后点击「重新选择」。'
+      );
+    }
+    throw new Error(`无法读取文件数据：${msg}`);
+  }
+
   const AudioCtx =
     window.AudioContext ||
     (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -111,7 +128,7 @@ export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResu
     decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
   } catch {
     throw new Error(
-      '无法解码该文件的音轨。请确认文件未损坏，或使用标准编码（MP4/MOV/WebM/MP3/WAV/M4A/FLAC/OGG）。'
+      '无法解码该文件的音轨。请确认文件未损坏且包含音轨，或使用标准编码（MP4/MOV/WebM/MP3/WAV/M4A/FLAC/OGG）。'
     );
   } finally {
     await audioCtx.close().catch(() => {});

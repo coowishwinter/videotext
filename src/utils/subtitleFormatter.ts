@@ -59,6 +59,78 @@ export function parseSrtTimestamp(value: string): number | null {
   return hrs * 3600 + mins * 60 + secs + ms / 1000;
 }
 
+/**
+ * Removes stray spaces between CJK characters & before Chinese punctuation
+ * while keeping normal spaces between Latin words intact.
+ */
+export function cleanTranscriptSpacing(text: string): string {
+  return text
+    .trim()
+    .replace(/([\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+([\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af])/g, '$1$2')
+    .replace(/\s+([，。！？；：、,.!?;:])/g, '$1')
+    .replace(/\s{2,}/g, ' ');
+}
+
+/**
+ * Splits overly long multi-sentence subtitle cues along natural punctuation boundaries
+ * and distributes timestamps proportionally to text length.
+ */
+function splitCueBySentence(
+  start: number,
+  end: number,
+  text: string,
+  baseIdx: number
+): SubtitleChunk[] {
+  const clean = cleanTranscriptSpacing(text);
+  if (clean.length < 28 || end - start < 3.5) {
+    return [
+      {
+        id: `${baseIdx}-${Math.round(start * 100)}-${Math.random().toString(36).slice(2, 6)}`,
+        start,
+        end,
+        text: clean,
+      },
+    ];
+  }
+
+  const parts = clean
+    .split(/(?<=[。！？；?!;])\s*/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (parts.length <= 1) {
+    return [
+      {
+        id: `${baseIdx}-${Math.round(start * 100)}-${Math.random().toString(36).slice(2, 6)}`,
+        start,
+        end,
+        text: clean,
+      },
+    ];
+  }
+
+  const totalChars = parts.reduce((sum, p) => sum + p.length, 0) || 1;
+  const duration = Math.max(0.5, end - start);
+  const result: SubtitleChunk[] = [];
+  let cursor = start;
+
+  for (let j = 0; j < parts.length; j++) {
+    const part = parts[j];
+    const ratio = part.length / totalChars;
+    const segEnd =
+      j === parts.length - 1 ? end : Math.min(end, cursor + duration * ratio);
+    result.push({
+      id: `${baseIdx}-${j}-${Math.round(cursor * 100)}-${Math.random().toString(36).slice(2, 5)}`,
+      start: cursor,
+      end: Math.max(cursor + 0.3, segEnd),
+      text: part,
+    });
+    cursor = segEnd;
+  }
+
+  return result;
+}
+
 export interface RawWhisperChunk {
   timestamp: [number | null, number | null];
   text: string;
@@ -70,25 +142,19 @@ export function normalizeWhisperChunks(
   totalDuration: number
 ): SubtitleChunk[] {
   if (!rawChunks || rawChunks.length === 0) {
-    const clean = fallbackText.trim();
+    const clean = cleanTranscriptSpacing(fallbackText);
     if (!clean) return [];
-    return [
-      {
-        id: crypto.randomUUID(),
-        start: 0,
-        end: Math.max(1, totalDuration || 3),
-        text: clean,
-      },
-    ];
+    return splitCueBySentence(0, Math.max(1, totalDuration || 3), clean, 0);
   }
 
   const normalized: SubtitleChunk[] = [];
   for (let i = 0; i < rawChunks.length; i++) {
     const raw = rawChunks[i];
-    const text = (raw.text || '').trim();
+    const text = cleanTranscriptSpacing(raw.text || '');
     if (!text) continue;
 
-    let start = raw.timestamp?.[0] ?? (normalized.length > 0 ? normalized[normalized.length - 1].end : 0);
+    let start =
+      raw.timestamp?.[0] ?? (normalized.length > 0 ? normalized[normalized.length - 1].end : 0);
     let end = raw.timestamp?.[1];
 
     if (start === null || !Number.isFinite(start) || start < 0) {
@@ -114,12 +180,8 @@ export function normalizeWhisperChunks(
       }
     }
 
-    normalized.push({
-      id: `${i}-${Math.round(start * 100)}-${Math.random().toString(36).slice(2, 6)}`,
-      start,
-      end,
-      text,
-    });
+    const splitCues = splitCueBySentence(start, end, text, i);
+    normalized.push(...splitCues);
   }
 
   return normalized;
@@ -129,13 +191,11 @@ export function wrapSubtitleText(text: string, maxChars: number): string {
   const clean = text.trim().replace(/\s+/g, ' ');
   if (!maxChars || maxChars <= 0 || clean.length <= maxChars) return clean;
 
-  // For CJK / mixed text, break cleanly near maxChars without splitting English words awkwardly
   const lines: string[] = [];
   let remaining = clean;
 
   while (remaining.length > maxChars) {
     let breakIdx = -1;
-    // Prefer breaking at punctuation or space within [maxChars * 0.55, maxChars]
     const searchStart = Math.floor(maxChars * 0.55);
     for (let i = maxChars; i >= searchStart; i--) {
       const ch = remaining[i];
@@ -177,14 +237,17 @@ export function generateTxt(
 ): string {
   let body = '';
   if (chunks.length === 0) {
-    body = fullText.trim();
+    body = cleanTranscriptSpacing(fullText);
   } else if (options.mode === 'continuous') {
-    body = chunks.map((c) => c.text.trim()).join(' ').replace(/\s+([，。！？；：,.!?;:])/g, '$1');
+    body = cleanTranscriptSpacing(chunks.map((c) => c.text.trim()).join(' '));
   } else if (options.mode === 'lines') {
     body = chunks.map((c) => c.text.trim()).join('\n');
   } else {
     body = chunks
-      .map((c) => `[${formatCompactTimestamp(c.start)} -> ${formatCompactTimestamp(c.end)}] ${c.text.trim()}`)
+      .map(
+        (c) =>
+          `[${formatCompactTimestamp(c.start)} -> ${formatCompactTimestamp(c.end)}] ${c.text.trim()}`
+      )
       .join('\n');
   }
 

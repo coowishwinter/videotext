@@ -1,4 +1,4 @@
-const APP_CACHE_NAME = 'shengji-app-shell-v1';
+const APP_CACHE_NAME = 'shengji-app-shell-v2';
 
 self.addEventListener('install', (event) => {
   self.skipWaiting();

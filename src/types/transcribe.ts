@@ -4,6 +4,11 @@ export type WhisperModelId =
   | 'Xenova/whisper-small'
   | 'onnx-community/whisper-large-v3-turbo';
 
+export type ModelDtypeMap = {
+  encoder_model: 'q8' | 'fp32' | 'fp16' | 'q4';
+  decoder_model_merged: 'q8' | 'fp32' | 'fp16' | 'q4';
+};
+
 export interface ModelOption {
   id: WhisperModelId;
   name: string;
@@ -13,10 +18,8 @@ export interface ModelOption {
   accuracyLabel: string;
   description: string;
   recommended?: boolean;
-  dtypeConfig: {
-    encoder_model: string;
-    decoder_model_merged: string;
-  };
+  wasmDtype: ModelDtypeMap;
+  webgpuDtype: ModelDtypeMap;
 }
 
 export const MODEL_OPTIONS: ModelOption[] = [
@@ -28,9 +31,13 @@ export const MODEL_OPTIONS: ModelOption[] = [
     speedLabel: '极速',
     accuracyLabel: '基础',
     description: '体积最小、加载最快，适合语音清晰的单人访谈或低内存设备。',
-    dtypeConfig: {
+    wasmDtype: {
       encoder_model: 'q8',
       decoder_model_merged: 'q8',
+    },
+    webgpuDtype: {
+      encoder_model: 'fp32',
+      decoder_model_merged: 'fp32',
     },
   },
   {
@@ -42,9 +49,13 @@ export const MODEL_OPTIONS: ModelOption[] = [
     accuracyLabel: '均衡',
     description: '速度与中文识别准确度的最佳平衡点，推荐作为日常批量处理默认模型。',
     recommended: true,
-    dtypeConfig: {
+    wasmDtype: {
       encoder_model: 'q8',
       decoder_model_merged: 'q8',
+    },
+    webgpuDtype: {
+      encoder_model: 'fp32',
+      decoder_model_merged: 'fp32',
     },
   },
   {
@@ -55,9 +66,13 @@ export const MODEL_OPTIONS: ModelOption[] = [
     speedLabel: '适中',
     accuracyLabel: '高精度',
     description: '对中英混杂、专业术语及轻度背景噪音的视频有明显更好的识别效果。',
-    dtypeConfig: {
+    wasmDtype: {
       encoder_model: 'q8',
       decoder_model_merged: 'q8',
+    },
+    webgpuDtype: {
+      encoder_model: 'fp32',
+      decoder_model_merged: 'fp32',
     },
   },
   {
@@ -68,9 +83,13 @@ export const MODEL_OPTIONS: ModelOption[] = [
     speedLabel: '需 WebGPU',
     accuracyLabel: '旗舰级',
     description: '最高精度的多语种大模型，建议在支持 WebGPU 的独立显卡电脑上使用。',
-    dtypeConfig: {
+    wasmDtype: {
       encoder_model: 'q8',
       decoder_model_merged: 'q8',
+    },
+    webgpuDtype: {
+      encoder_model: 'fp32',
+      decoder_model_merged: 'q4',
     },
   },
 ];

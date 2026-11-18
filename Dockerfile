@@ -8,20 +8,28 @@ RUN npm install
 COPY . .
 RUN npm run build
 
-FROM node:20-alpine AS runner
+FROM nginx:alpine AS runner
 
-WORKDIR /app
+COPY --from=builder /app/dist /usr/share/nginx/html
 
-ENV NODE_ENV=production
-ENV PORT=3000
-
-COPY package*.json ./
-RUN npm ci --only=production
-
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/server.ts ./server.ts
-COPY --from=builder /app/package.json ./package.json
+RUN printf 'server {\n\
+  listen 3000;\n\
+  server_name _;\n\
+  root /usr/share/nginx/html;\n\
+  index index.html;\n\
+  types {\n\
+    application/wasm wasm;\n\
+    application/javascript mjs js;\n\
+    text/css css;\n\
+    text/html html;\n\
+    application/json json;\n\
+    image/svg+xml svg;\n\
+  }\n\
+  location / {\n\
+    try_files $uri $uri/ /index.html;\n\
+  }\n\
+}\n' > /etc/nginx/conf.d/default.conf
 
 EXPOSE 3000
 
-CMD ["npx", "tsx", "server.ts"]
+CMD ["nginx", "-g", "daemon off;"]

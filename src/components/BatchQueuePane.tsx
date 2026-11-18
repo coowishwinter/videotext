@@ -36,6 +36,7 @@ interface BatchQueuePaneProps {
   onExportSingleTxt: (item: MediaQueueItem) => void;
   onBatchExportZip: (format: 'srt' | 'txt' | 'both') => void;
   onBatchExportMergedTxt: () => void;
+  onRelinkFile: (id: string, file: File) => void;
 }
 
 type FilterTab = 'all' | 'pending' | 'processing' | 'completed' | 'error';
@@ -57,12 +58,15 @@ export const BatchQueuePane: React.FC<BatchQueuePaneProps> = ({
   onExportSingleTxt,
   onBatchExportZip,
   onBatchExportMergedTxt,
+  onRelinkFile,
 }) => {
   const [filterTab, setFilterTab] = useState<FilterTab>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
+  const [relinkTargetId, setRelinkTargetId] = useState<string | null>(null);
   const folderPickerRef = useRef<HTMLInputElement>(null);
   const filePickerRef = useRef<HTMLInputElement>(null);
+  const relinkInputRef = useRef<HTMLInputElement>(null);
 
   const counts = useMemo(() => {
     let pending = 0;
@@ -179,6 +183,20 @@ export const BatchQueuePane: React.FC<BatchQueuePaneProps> = ({
             onAddFiles(e.target.files);
             e.target.value = '';
           }
+        }}
+      />
+      <input
+        ref={relinkInputRef}
+        type="file"
+        accept="audio/*,video/*,.mp4,.mov,.mkv,.webm,.avi,.mp3,.wav,.m4a,.flac,.ogg,.aac,.opus"
+        className="hidden"
+        onChange={(e) => {
+          const picked = e.target.files?.[0];
+          if (picked && relinkTargetId) {
+            onRelinkFile(relinkTargetId, picked);
+          }
+          setRelinkTargetId(null);
+          e.target.value = '';
         }}
       />
 
@@ -462,6 +480,21 @@ export const BatchQueuePane: React.FC<BatchQueuePaneProps> = ({
                   className="flex items-center gap-1 shrink-0"
                   onClick={(e) => e.stopPropagation()}
                 >
+                  {item.status === 'error' && (
+                    <button
+                      type="button"
+                      title="重新选择本地文件"
+                      onClick={() => {
+                        setRelinkTargetId(item.id);
+                        relinkInputRef.current?.click();
+                      }}
+                      disabled={isBatchRunning}
+                      className="rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-40 whitespace-nowrap dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      重选文件
+                    </button>
+                  )}
+
                   {(item.status === 'queued' ||
                     item.status === 'error' ||
                     item.status === 'cancelled') &&

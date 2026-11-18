@@ -20,7 +20,7 @@ import {
   decodeMediaTo16kMono,
   detectMediaKind,
   isSupportedMediaFile,
-  probeMediaDuration,
+  probeMediaDurationFromUrl,
 } from './utils/audioDecoder';
 import {
   clearModelCache,
@@ -256,17 +256,21 @@ export default function App() {
 
       if (msg.type === 'transcribe-progress') {
         setQueue((prev) =>
-          prev.map((item) =>
-            item.id === msg.taskId
-              ? {
-                  ...item,
-                  status: 'transcribing',
-                  progress: msg.progress,
-                  stageText: `识别第 ${msg.chunkIndex}/${msg.totalChunks} 段 · ${msg.progress}%`,
-                  streamingText: msg.streamingText,
-                }
-              : item
-          )
+          prev.map((item) => {
+            if (item.id !== msg.taskId) return item;
+            const liveChunks = msg.partialChunks
+              ? normalizeWhisperChunks(msg.partialChunks, msg.streamingText, item.duration)
+              : item.chunks;
+            return {
+              ...item,
+              status: 'transcribing',
+              progress: msg.progress,
+              stageText: `识别第 ${msg.chunkIndex}/${msg.totalChunks} 段 · ${msg.progress}%`,
+              streamingText: msg.streamingText,
+              chunks: liveChunks,
+              languageUsed: msg.detectedLanguage ?? item.languageUsed,
+            };
+          })
         );
         return;
       }
@@ -356,10 +360,10 @@ export default function App() {
     setSelectedId((prev) => prev ?? newItems[0].id);
     setActiveTab('workspace');
 
-    // Probe durations asynchronously so queue displays accurate total time immediately
+    // Probe durations asynchronously reusing objectUrl to avoid duplicate file handles
     for (const item of newItems) {
-      if (!item.file) continue;
-      probeMediaDuration(item.file).then((dur) => {
+      if (!item.objectUrl) continue;
+      probeMediaDurationFromUrl(item.objectUrl, item.fileType).then((dur) => {
         if (dur > 0) {
           setQueue((prev) =>
             prev.map((q) => (q.id === item.id ? { ...q, duration: dur } : q))
@@ -367,6 +371,37 @@ export default function App() {
         }
       });
     }
+  }, []);
+
+  const handleRelinkFile = useCallback((id: string, file: File) => {
+    const newUrl = URL.createObjectURL(file);
+    const kind = detectMediaKind(file);
+    setQueue((prev) =>
+      prev.map((item) => {
+        if (item.id !== id) return item;
+        if (item.objectUrl) URL.revokeObjectURL(item.objectUrl);
+        return {
+          ...item,
+          file,
+          objectUrl: newUrl,
+          fileName: file.name,
+          fileSize: file.size,
+          fileType: kind,
+          mimeType: file.type || '',
+          status: 'queued',
+          progress: 0,
+          stageText: '等待转录',
+          errorMessage: undefined,
+        };
+      })
+    );
+    probeMediaDurationFromUrl(newUrl, kind).then((dur) => {
+      if (dur > 0) {
+        setQueue((prev) =>
+          prev.map((q) => (q.id === id ? { ...q, duration: dur } : q))
+        );
+      }
+    });
   }, []);
 
   const runSingleItem = useCallback(async (item: MediaQueueItem) => {
@@ -880,6 +915,7 @@ export default function App() {
               onExportSingleTxt={handleExportSingleTxt}
               onBatchExportZip={handleBatchExportZip}
               onBatchExportMergedTxt={handleBatchExportMergedTxt}
+              onRelinkFile={handleRelinkFile}
             />
 
             <TranscriptInspector
