@@ -445,6 +445,8 @@ self.onmessage = async (event: MessageEvent<WorkerIncomingMessage>) => {
         stride_length_s: strideLengthS,
         return_timestamps: true,
         task: msg.task,
+        return_language: true,
+        suppress_tokens: [],
       };
 
       if (msg.language && msg.language !== 'auto') {
@@ -456,6 +458,16 @@ self.onmessage = async (event: MessageEvent<WorkerIncomingMessage>) => {
 
       const output = await pipe(msg.audioData, callOptions);
       const single = Array.isArray(output) ? output[0] : output;
+
+      // Ensure progress hits 100% and finishes cleanly
+      self.postMessage({
+        type: 'transcribe-progress',
+        taskId: msg.taskId,
+        progress: 100,
+        chunkIndex: estimatedChunks,
+        totalChunks: estimatedChunks,
+        streamingText: (single?.text || '').slice(-300),
+      } satisfies WorkerOutgoingMessage);
 
       self.postMessage({
         type: 'transcribe-result',
