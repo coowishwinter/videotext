@@ -1,4 +1,19 @@
+import * as OpenCC from 'opencc-js/t2cn';
+import * as OpenCCReverse from 'opencc-js/cn2t';
 import { TranscriptSegment } from '../types/speech';
+
+const t2sConverter = OpenCC.Converter({ from: 't', to: 'cn' });
+const s2tConverter = OpenCCReverse.Converter({ from: 'cn', to: 't' });
+
+export function convertToSimplifiedChinese(text: string): string {
+  if (!text) return '';
+  return t2sConverter(text);
+}
+
+export function convertToTraditionalChinese(text: string): string {
+  if (!text) return '';
+  return s2tConverter(text);
+}
 
 export function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return '00:00';

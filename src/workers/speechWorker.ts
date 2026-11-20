@@ -1,5 +1,10 @@
 import { TextStreamer, env, pipeline } from '@huggingface/transformers';
+import * as OpenCC_T2CN from 'opencc-js/t2cn';
+import * as OpenCC_CN2T from 'opencc-js/cn2t';
 import { MODEL_OPTIONS } from '../types/speech';
+
+const toSimplified = OpenCC_T2CN.Converter({ from: 't', to: 'cn' });
+const toTraditional = OpenCC_CN2T.Converter({ from: 'cn', to: 't' });
 
 export interface WorkerLocalFileEntry {
   relativePath: string;
@@ -388,6 +393,8 @@ function splitAudioSegments(audio: Float32Array, sampleRate = 16000): AudioSegme
 }
 
 const LANGUAGE_NAME_TO_SHORT: Record<string, string> = {
+  'zh-hans': 'zh',
+  'zh-hant': 'zh',
   chinese: 'zh',
   english: 'en',
   japanese: 'ja',
@@ -430,8 +437,8 @@ async function detectLanguageCode(pipe: any, sampleAudio: Float32Array): Promise
   return 'zh';
 }
 
-function cleanDecodedText(text: string): string {
-  return text
+function cleanDecodedText(text: string, targetScript: 'hans' | 'hant' | 'raw'): string {
+  const spaced = text
     .trim()
     .replace(
       /([\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+([\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af])/g,
@@ -441,6 +448,11 @@ function cleanDecodedText(text: string): string {
     .replace(/\s{2,}/g, ' ')
     .replace(/(.{4,36}?)\1{2,}/g, '$1')
     .trim();
+
+  if (!spaced) return '';
+  if (targetScript === 'hans') return toSimplified(spaced);
+  if (targetScript === 'hant') return toTraditional(spaced);
+  return spaced;
 }
 
 self.onmessage = async (event: MessageEvent<SpeechWorkerIncoming>) => {
@@ -532,6 +544,13 @@ self.onmessage = async (event: MessageEvent<SpeechWorkerIncoming>) => {
         langCode = await detectLanguageCode(pipe, sampleSlice);
       }
 
+      const targetScript: 'hans' | 'hant' | 'raw' =
+        msg.language === 'zh-hans' || (msg.language === 'auto' && langCode === 'zh')
+          ? 'hans'
+          : msg.language === 'zh-hant'
+            ? 'hant'
+            : 'raw';
+
       const recognizedSegments: Array<{
         id: string;
         startSec: number;
@@ -560,7 +579,7 @@ self.onmessage = async (event: MessageEvent<SpeechWorkerIncoming>) => {
                 if (now - lastPostTime > 280) {
                   lastPostTime = now;
                   const basePct = Math.round((idx / totalSegments) * 100);
-                  const liveClean = cleanDecodedText(streamBuf);
+                  const liveClean = cleanDecodedText(streamBuf, targetScript);
                   self.postMessage({
                     type: 'transcribe-progress',
                     taskId: msg.taskId,
@@ -608,7 +627,7 @@ self.onmessage = async (event: MessageEvent<SpeechWorkerIncoming>) => {
             }
           }
 
-          const clean = cleanDecodedText(result?.text || streamBuf || '');
+          const clean = cleanDecodedText(result?.text || streamBuf || '', targetScript);
           const prevText =
             recognizedSegments.length > 0
               ? recognizedSegments[recognizedSegments.length - 1].text

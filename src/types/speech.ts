@@ -91,8 +91,10 @@ export interface LanguageOption {
 }
 
 export const LANGUAGE_OPTIONS: LanguageOption[] = [
-  { code: 'chinese', label: '中文（普通话 / 粤语）' },
-  { code: 'auto', label: '自动检测语言' },
+  { code: 'zh-hans', label: '简体中文（推荐 · 自动繁转简）' },
+  { code: 'zh-hant', label: '繁體中文' },
+  { code: 'chinese', label: '中文（模型原样输出）' },
+  { code: 'auto', label: '自动检测语言（中文转简体）' },
   { code: 'english', label: 'English（英语）' },
   { code: 'japanese', label: '日本語（日语）' },
   { code: 'korean', label: '한국어（韩语）' },

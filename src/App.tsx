@@ -28,6 +28,7 @@ import {
   saveTranscriptToDB,
 } from './utils/storage';
 import {
+  convertToSimplifiedChinese,
   downloadTxtFile,
   formatSegmentsText,
   getBaseFileName,
@@ -37,7 +38,7 @@ import type { SpeechWorkerOutgoing, WorkerLocalFileEntry } from './workers/speec
 const DEFAULT_CONFIG: SpeechConfig = {
   modelId: 'Xenova/whisper-base',
   device: 'auto',
-  language: 'chinese',
+  language: 'zh-hans',
   downloadSource: 'huggingface',
   customMirrorUrl: 'https://hf-mirror.com/',
   offlineOnly: false,
@@ -625,6 +626,29 @@ export default function App() {
     }
   }, []);
 
+  const handleConvertSimplified = useCallback((jobId: string) => {
+    let updated: TranscriptJob | null = null;
+    setJobs((prev) =>
+      prev.map((j) => {
+        if (j.id !== jobId) return j;
+        const convertedSegments = j.segments.map((seg) => ({
+          ...seg,
+          text: convertToSimplifiedChinese(seg.text),
+        }));
+        const convertedFullText = convertToSimplifiedChinese(j.fullText);
+        updated = {
+          ...j,
+          segments: convertedSegments,
+          fullText: convertedFullText,
+        };
+        return updated;
+      })
+    );
+    if (updated && (updated as TranscriptJob).status === 'completed') {
+      saveTranscriptToDB(updated);
+    }
+  }, []);
+
   const handleExportTxt = useCallback((job: TranscriptJob, includeTimestamps: boolean) => {
     const content =
       includeTimestamps && job.segments.length > 0
@@ -816,8 +840,10 @@ export default function App() {
             onRetryWithMirror={handleRetryWithMirror}
             onRetryWithWasm={handleRetryWithWasm}
             onUpdateText={handleUpdateText}
+            onConvertSimplified={handleConvertSimplified}
             onExportTxt={handleExportTxt}
             onRemoveJob={handleRemoveJob}
+            onOpenGuide={() => setActiveTab('guide')}
           />
         </main>
       )}
