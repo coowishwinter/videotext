@@ -1,21 +1,19 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BatchQueuePane } from './components/BatchQueuePane';
-import { FormatGuideView } from './components/FormatGuideView';
-import { ModelsManagerView } from './components/ModelsManagerView';
-import { PrivacyGuideView } from './components/PrivacyGuideView';
-import { SidebarConfig } from './components/SidebarConfig';
-import { TopHeader } from './components/TopHeader';
-import { TranscriptInspector } from './components/TranscriptInspector';
+import { ConfigSidebar } from './components/ConfigSidebar';
+import { GuideView } from './components/GuideView';
+import { ModelsView } from './components/ModelsView';
+import { SpeechWorkspace } from './components/SpeechWorkspace';
+import { TopBar } from './components/TopBar';
 import {
-  ActiveNavTab,
-  EngineConfig,
-  ExportSettings,
-  MediaQueueItem,
-  ModelCacheStatus,
-  ModelDownloadProgress,
-  SubtitleChunk,
+  ActiveTab,
+  DOWNLOAD_SOURCE_HOSTS,
+  ModelCacheInfo,
+  ModelDownloadState,
+  SpeechConfig,
+  TranscriptJob,
+  TranscriptSegment,
   WhisperModelId,
-} from './types/transcribe';
+} from './types/speech';
 import {
   decodeMediaTo16kMono,
   detectMediaKind,
@@ -30,39 +28,35 @@ import {
   saveTranscriptToDB,
 } from './utils/storage';
 import {
-  downloadTextFile,
-  exportBatchAsZip,
-  exportMergedTxt,
-  generateSrt,
-  generateTxt,
+  downloadTxtFile,
+  formatSegmentsText,
   getBaseFileName,
-  normalizeWhisperChunks,
-} from './utils/subtitleFormatter';
-import type { WorkerLocalFileEntry, WorkerOutgoingMessage } from './workers/whisperWorker';
+} from './utils/textFormatter';
+import type { SpeechWorkerOutgoing, WorkerLocalFileEntry } from './workers/speechWorker';
 
-const DEFAULT_CONFIG: EngineConfig = {
+const DEFAULT_CONFIG: SpeechConfig = {
   modelId: 'Xenova/whisper-base',
   device: 'auto',
-  language: 'auto',
-  task: 'transcribe',
-  remoteHost: 'https://huggingface.co/',
+  language: 'chinese',
+  downloadSource: 'huggingface',
+  customMirrorUrl: 'https://hf-mirror.com/',
   offlineOnly: false,
-  localModelLoadedName: null,
+  localModelName: null,
 };
 
-const DEFAULT_EXPORT_SETTINGS: ExportSettings = {
-  srtIncludeBom: true,
-  srtMaxLineChars: 24,
-  txtMode: 'lines',
-  txtIncludeTitle: false,
-};
-
-const STORAGE_CONFIG_KEY = 'shengji_engine_config_v1';
-const STORAGE_EXPORT_KEY = 'shengji_export_settings_v1';
+const STORAGE_CONFIG_KEY = 'shengji_stt_config_v2';
 const STORAGE_THEME_KEY = 'shengji_theme_v1';
 
+function resolveRemoteHost(cfg: SpeechConfig): string {
+  if (cfg.downloadSource === 'hf-mirror') return DOWNLOAD_SOURCE_HOSTS['hf-mirror'];
+  if (cfg.downloadSource === 'custom' && cfg.customMirrorUrl.trim()) {
+    return cfg.customMirrorUrl.trim();
+  }
+  return DOWNLOAD_SOURCE_HOSTS.huggingface;
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<ActiveNavTab>('workspace');
+  const [activeTab, setActiveTab] = useState<ActiveTab>('workspace');
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_THEME_KEY);
@@ -73,11 +67,11 @@ export default function App() {
     return 'light';
   });
 
-  const [config, setConfig] = useState<EngineConfig>(() => {
+  const [config, setConfig] = useState<SpeechConfig>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_CONFIG_KEY);
       if (saved) {
-        return { ...DEFAULT_CONFIG, ...JSON.parse(saved), localModelLoadedName: null };
+        return { ...DEFAULT_CONFIG, ...JSON.parse(saved), localModelName: null };
       }
     } catch {
       // ignore
@@ -85,26 +79,16 @@ export default function App() {
     return DEFAULT_CONFIG;
   });
 
-  const [exportSettings, setExportSettings] = useState<ExportSettings>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_EXPORT_KEY);
-      if (saved) return { ...DEFAULT_EXPORT_SETTINGS, ...JSON.parse(saved) };
-    } catch {
-      // ignore
-    }
-    return DEFAULT_EXPORT_SETTINGS;
-  });
-
-  const [queue, setQueue] = useState<MediaQueueItem[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const [jobs, setJobs] = useState<TranscriptJob[]>([]);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [isOnline, setIsOnline] = useState<boolean>(
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const [webgpuSupported, setWebgpuSupported] = useState<boolean | null>(null);
   const [activeDeviceUsed, setActiveDeviceUsed] = useState<'webgpu' | 'wasm' | null>(null);
-  const [cacheMap, setCacheMap] = useState<Record<string, ModelCacheStatus>>({});
-  const [downloadState, setDownloadState] = useState<ModelDownloadProgress>({
+  const [cacheMap, setCacheMap] = useState<Record<string, ModelCacheInfo>>({});
+  const [downloadState, setDownloadState] = useState<ModelDownloadState>({
     modelId: DEFAULT_CONFIG.modelId,
     status: 'idle',
     progress: 0,
@@ -112,55 +96,43 @@ export default function App() {
     totalBytes: 0,
     currentFile: '',
   });
-  const [noticeBanner, setNoticeBanner] = useState<{
-    type: 'info' | 'error';
-    message: string;
-  } | null>(null);
+  const [banner, setBanner] = useState<{ type: 'info' | 'error'; message: string } | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
   const stopRequestedRef = useRef(false);
-  const queueRef = useRef<MediaQueueItem[]>([]);
-  const configRef = useRef<EngineConfig>(config);
+  const jobsRef = useRef<TranscriptJob[]>([]);
+  const configRef = useRef<SpeechConfig>(config);
   const localModelFilesRef = useRef<{ name: string; files: WorkerLocalFileEntry[] } | null>(null);
   const globalFilePickerRef = useRef<HTMLInputElement>(null);
 
-  // Pending task promise resolver map for worker transcription tasks
   const pendingTasksRef = useRef<
     Map<
       string,
       {
         resolve: (val: {
           text: string;
-          chunks: Array<{ timestamp: [number | null, number | null]; text: string }>;
+          segments: TranscriptSegment[];
           deviceUsed: 'webgpu' | 'wasm';
+          detectedLanguage?: string;
         }) => void;
         reject: (err: Error) => void;
-        duration: number;
       }
     >
   >(new Map());
 
   useEffect(() => {
-    queueRef.current = queue;
-  }, [queue]);
+    jobsRef.current = jobs;
+  }, [jobs]);
 
   useEffect(() => {
     configRef.current = config;
     try {
-      const { localModelLoadedName: _ignored, ...persistable } = config;
+      const { localModelName: _ignored, ...persistable } = config;
       localStorage.setItem(STORAGE_CONFIG_KEY, JSON.stringify(persistable));
     } catch {
       // ignore
     }
   }, [config]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_EXPORT_KEY, JSON.stringify(exportSettings));
-    } catch {
-      // ignore
-    }
-  }, [exportSettings]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -196,11 +168,12 @@ export default function App() {
     if (workerRef.current) {
       workerRef.current.terminate();
     }
-    const worker = new Worker(new URL('./workers/whisperWorker.ts', import.meta.url), {
+
+    const worker = new Worker(new URL('./workers/speechWorker.ts', import.meta.url), {
       type: 'module',
     });
 
-    worker.onmessage = (event: MessageEvent<WorkerOutgoingMessage>) => {
+    worker.onmessage = (event: MessageEvent<SpeechWorkerOutgoing>) => {
       const msg = event.data;
 
       if (msg.type === 'capabilities') {
@@ -209,9 +182,9 @@ export default function App() {
       }
 
       if (msg.type === 'local-model-registered') {
-        setNoticeBanner({
+        setBanner({
           type: 'info',
-          message: `已挂载本地模型目录「${msg.modelName}」（共 ${msg.fileCount} 个文件），可完全断网使用。`,
+          message: `已挂载本地模型目录「${msg.modelName}」（共 ${msg.fileCount} 个文件），可离线直接识别。`,
         });
         return;
       }
@@ -225,6 +198,20 @@ export default function App() {
           totalBytes: msg.total,
           currentFile: msg.file,
         });
+
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.status === 'processing' && j.step === 'loading-model'
+              ? {
+                  ...j,
+                  progress: Math.max(8, Math.min(28, 8 + Math.round(msg.progress * 0.2))),
+                  statusText: msg.file
+                    ? `正在加载模型文件 ${msg.file} (${msg.progress}%)`
+                    : `正在加载本地模型 (${msg.progress}%)`,
+                }
+              : j
+          )
+        );
         return;
       }
 
@@ -247,28 +234,27 @@ export default function App() {
           status: 'error',
           error: msg.error,
         }));
-        setNoticeBanner({
+        setBanner({
           type: 'error',
-          message: `模型加载失败：${msg.error}`,
+          message: `模型加载失败：${msg.error}（可尝试切换「国内镜像 hf-mirror.com」重试）`,
         });
         return;
       }
 
       if (msg.type === 'transcribe-progress') {
-        setQueue((prev) =>
-          prev.map((item) => {
-            if (item.id !== msg.taskId) return item;
-            const liveChunks = msg.partialChunks
-              ? normalizeWhisperChunks(msg.partialChunks, msg.streamingText, item.duration)
-              : item.chunks;
+        setJobs((prev) =>
+          prev.map((j) => {
+            if (j.id !== msg.taskId) return j;
+            const scaledPct = Math.min(99, Math.max(30, 30 + Math.round(msg.progress * 0.69)));
             return {
-              ...item,
-              status: 'transcribing',
-              progress: msg.progress,
-              stageText: `识别第 ${msg.chunkIndex}/${msg.totalChunks} 段 · ${msg.progress}%`,
-              streamingText: msg.streamingText,
-              chunks: liveChunks,
-              languageUsed: msg.detectedLanguage ?? item.languageUsed,
+              ...j,
+              status: 'processing',
+              step: 'transcribing',
+              progress: msg.progress === 100 ? 99 : scaledPct,
+              statusText: `正在识别第 ${msg.segmentIndex}/${msg.totalSegments} 段 · ${msg.progress}%`,
+              liveText: msg.liveText,
+              segments: msg.segments,
+              detectedLanguage: msg.detectedLanguage ?? j.detectedLanguage,
             };
           })
         );
@@ -281,8 +267,9 @@ export default function App() {
           pendingTasksRef.current.delete(msg.taskId);
           pending.resolve({
             text: msg.text,
-            chunks: msg.chunks,
+            segments: msg.segments,
             deviceUsed: msg.deviceUsed,
+            detectedLanguage: msg.detectedLanguage,
           });
         }
         return;
@@ -314,59 +301,57 @@ export default function App() {
   useEffect(() => {
     const w = initWorker();
     refreshCacheStatus();
-    loadTranscriptsFromDB().then((historyItems) => {
-      if (historyItems.length > 0) {
-        setQueue((prev) => (prev.length === 0 ? historyItems : [...prev, ...historyItems]));
-        setSelectedId((prev) => prev ?? historyItems[0].id);
+    loadTranscriptsFromDB().then((history) => {
+      if (history.length > 0) {
+        setJobs((prev) => (prev.length === 0 ? history : [...prev, ...history]));
+        setActiveJobId((prev) => prev ?? history[0].id);
       }
     });
-
     return () => {
       w.terminate();
     };
   }, [initWorker, refreshCacheStatus]);
 
-  const handleAddFiles = useCallback(async (fileList: FileList | File[]) => {
+  const handleAddFiles = useCallback((fileList: FileList | File[]) => {
     const rawFiles = Array.from(fileList);
-    const validFiles = rawFiles.filter(isSupportedMediaFile);
-    if (validFiles.length === 0) {
-      setNoticeBanner({
+    const valid = rawFiles.filter(isSupportedMediaFile);
+    if (valid.length === 0) {
+      setBanner({
         type: 'error',
-        message: '未检测到支持的音视频文件（支持 MP4、MOV、WebM、MKV、MP3、WAV、M4A、FLAC、OGG 等）。',
+        message: '未检测到支持的音视频格式（支持 MP3、WAV、M4A、FLAC、OGG、WebM、MP4、MOV 等）。',
       });
       return;
     }
 
-    setNoticeBanner(null);
-    const newItems: MediaQueueItem[] = validFiles.map((file) => ({
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    setBanner(null);
+    const created: TranscriptJob[] = valid.map((file) => ({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       file,
       objectUrl: URL.createObjectURL(file),
       fileName: file.name,
       fileSize: file.size,
-      fileType: detectMediaKind(file),
-      mimeType: file.type || '',
+      mediaKind: detectMediaKind(file),
       duration: 0,
-      status: 'queued',
+      status: 'ready',
+      step: 'idle',
       progress: 0,
-      stageText: '等待转录',
-      chunks: [],
+      statusText: '准备就绪',
+      liveText: '',
+      segments: [],
       fullText: '',
       createdAt: Date.now(),
-      selectedForExport: true,
     }));
 
-    setQueue((prev) => [...newItems, ...prev]);
-    setSelectedId((prev) => prev ?? newItems[0].id);
+    setJobs((prev) => [...created, ...prev]);
+    setActiveJobId(created[0].id);
     setActiveTab('workspace');
 
-    // Probe durations asynchronously reusing objectUrl to avoid duplicate file handles
-    for (const item of newItems) {
+    for (const item of created) {
       if (!item.objectUrl) continue;
-      probeMediaDurationFromUrl(item.objectUrl, item.fileType).then((dur) => {
+      probeMediaDurationFromUrl(item.objectUrl, item.mediaKind).then((dur) => {
         if (dur > 0) {
-          setQueue((prev) =>
-            prev.map((q) => (q.id === item.id ? { ...q, duration: dur } : q))
+          setJobs((prev) =>
+            prev.map((j) => (j.id === item.id ? { ...j, duration: dur } : j))
           );
         }
       });
@@ -375,348 +360,292 @@ export default function App() {
 
   const handleRelinkFile = useCallback((id: string, file: File) => {
     const newUrl = URL.createObjectURL(file);
-    const kind = detectMediaKind(file);
-    setQueue((prev) =>
-      prev.map((item) => {
-        if (item.id !== id) return item;
-        if (item.objectUrl) URL.revokeObjectURL(item.objectUrl);
+    const mediaKind = detectMediaKind(file);
+    setJobs((prev) =>
+      prev.map((j) => {
+        if (j.id !== id) return j;
+        if (j.objectUrl) URL.revokeObjectURL(j.objectUrl);
         return {
-          ...item,
+          ...j,
           file,
           objectUrl: newUrl,
           fileName: file.name,
           fileSize: file.size,
-          fileType: kind,
-          mimeType: file.type || '',
-          status: 'queued',
+          mediaKind,
+          status: 'ready',
+          step: 'idle',
           progress: 0,
-          stageText: '等待转录',
-          errorMessage: undefined,
+          statusText: '已重新载入文件',
+          errorDetail: undefined,
+          isHistoryOnly: false,
         };
       })
     );
-    probeMediaDurationFromUrl(newUrl, kind).then((dur) => {
+    probeMediaDurationFromUrl(newUrl, mediaKind).then((dur) => {
       if (dur > 0) {
-        setQueue((prev) =>
-          prev.map((q) => (q.id === id ? { ...q, duration: dur } : q))
-        );
+        setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, duration: dur } : j)));
       }
     });
   }, []);
 
-  const runSingleItem = useCallback(async (item: MediaQueueItem) => {
-    if (!item.file || !workerRef.current) return;
-    const cfg = configRef.current;
+  const runTranscribeJob = useCallback(
+    async (jobId: string, overrideCfg?: SpeechConfig) => {
+      const target = jobsRef.current.find((j) => j.id === jobId);
+      if (!target || !target.file || !workerRef.current || isProcessing) return;
 
-    if (
-      cfg.offlineOnly &&
-      !cfg.localModelLoadedName &&
-      !cacheMap[cfg.modelId]?.cached
-    ) {
-      const msg =
-        '当前开启了「严格离线模式」，但所选模型尚未缓存到本地。请先关闭严格离线模式下载模型，或导入本地模型文件夹。';
-      setQueue((prev) =>
-        prev.map((q) =>
-          q.id === item.id ? { ...q, status: 'error', errorMessage: msg } : q
-        )
-      );
-      return;
-    }
+      const cfg = overrideCfg ?? configRef.current;
 
-    const startedAt = performance.now();
-    setQueue((prev) =>
-      prev.map((q) =>
-        q.id === item.id
-          ? {
-              ...q,
-              status: 'decoding',
-              progress: 3,
-              stageText: '正在本地提取音轨...',
-              errorMessage: undefined,
-              streamingText: '',
-            }
-          : q
-      )
-    );
-
-    try {
-      const { audioData, duration } = await decodeMediaTo16kMono(item.file);
-      if (stopRequestedRef.current) {
-        setQueue((prev) =>
-          prev.map((q) =>
-            q.id === item.id
-              ? { ...q, status: 'cancelled', progress: 0, stageText: '已暂停' }
-              : q
+      if (cfg.offlineOnly && !cfg.localModelName && !cacheMap[cfg.modelId]?.cached) {
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === jobId
+              ? {
+                  ...j,
+                  status: 'error',
+                  step: 'loading-model',
+                  statusText: '离线缓存检查失败',
+                  errorDetail:
+                    '当前已开启「严格离线模式」，但所选模型尚未缓存。请先取消勾选离线模式完成一次缓存，或导入本地模型文件夹。',
+                }
+              : j
           )
         );
         return;
       }
 
-      setQueue((prev) =>
-        prev.map((q) =>
-          q.id === item.id
+      stopRequestedRef.current = false;
+      setIsProcessing(true);
+      setBanner(null);
+      const startedAt = performance.now();
+
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.id === jobId
             ? {
-                ...q,
-                duration: duration || q.duration,
-                status: 'transcribing',
-                progress: 6,
-                stageText: '正在载入本地模型...',
+                ...j,
+                status: 'processing',
+                step: 'decoding',
+                progress: 4,
+                statusText: '正在本地提取并重采样 16kHz 音轨...',
+                liveText: '',
+                errorDetail: undefined,
               }
-            : q
+            : j
         )
       );
 
-      const result = await new Promise<{
-        text: string;
-        chunks: Array<{ timestamp: [number | null, number | null]; text: string }>;
-        deviceUsed: 'webgpu' | 'wasm';
-      }>((resolve, reject) => {
-        pendingTasksRef.current.set(item.id, {
-          resolve,
-          reject,
-          duration: duration || item.duration,
+      let failedStep: 'decoding' | 'loading-model' | 'transcribing' = 'decoding';
+
+      try {
+        const { audioData, duration } = await decodeMediaTo16kMono(target.file);
+        if (stopRequestedRef.current) return;
+
+        failedStep = 'loading-model';
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === jobId
+              ? {
+                  ...j,
+                  duration: duration || j.duration,
+                  step: 'loading-model',
+                  progress: 10,
+                  statusText: '正在载入本地 Whisper 模型...',
+                }
+              : j
+          )
+        );
+
+        const result = await new Promise<{
+          text: string;
+          segments: TranscriptSegment[];
+          deviceUsed: 'webgpu' | 'wasm';
+          detectedLanguage?: string;
+        }>((resolve, reject) => {
+          pendingTasksRef.current.set(jobId, { resolve, reject });
+          failedStep = 'transcribing';
+
+          workerRef.current?.postMessage(
+            {
+              type: 'transcribe',
+              taskId: jobId,
+              audioData,
+              duration,
+              modelId: cfg.modelId,
+              device: cfg.device,
+              language: cfg.language,
+              remoteHost: resolveRemoteHost(cfg),
+              offlineOnly: cfg.offlineOnly,
+              useLocalFolderModel: Boolean(cfg.localModelName),
+            },
+            [audioData.buffer]
+          );
         });
 
-        workerRef.current?.postMessage(
-          {
-            type: 'transcribe',
-            taskId: item.id,
-            audioData,
-            duration,
-            modelId: cfg.modelId,
-            device: cfg.device,
-            language: cfg.language,
-            task: cfg.task,
-            remoteHost: cfg.remoteHost,
-            offlineOnly: cfg.offlineOnly,
-            useLocalFolderModel: Boolean(cfg.localModelLoadedName),
-          },
-          [audioData.buffer]
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        const completedAt = Date.now();
+        const finalText = result.text || formatSegmentsText(result.segments, '', false);
+
+        let completedSnapshot: TranscriptJob | null = null;
+        setJobs((prev) =>
+          prev.map((j) => {
+            if (j.id !== jobId) return j;
+            completedSnapshot = {
+              ...j,
+              duration: duration || j.duration,
+              status: 'completed',
+              step: 'done',
+              progress: 100,
+              statusText: '已完成',
+              liveText: '',
+              segments: result.segments,
+              fullText: finalText,
+              elapsedMs,
+              deviceUsed: result.deviceUsed,
+              detectedLanguage: result.detectedLanguage,
+              modelUsed: cfg.localModelName || cfg.modelId,
+              completedAt,
+            };
+            return completedSnapshot;
+          })
         );
-      });
 
-      const normalizedChunks = normalizeWhisperChunks(
-        result.chunks,
-        result.text,
-        duration || item.duration
-      );
-      const finalFullText =
-        normalizedChunks.map((c) => c.text).join('\n') || result.text;
-      const elapsedMs = Math.round(performance.now() - startedAt);
-      const completedAt = Date.now();
+        if (completedSnapshot) {
+          await saveTranscriptToDB(completedSnapshot);
+        }
+      } catch (err) {
+        if (stopRequestedRef.current) return;
+        const raw = err instanceof Error ? err.message : String(err);
+        let friendly = raw;
+        if (
+          raw.includes('Failed to fetch') ||
+          raw.includes('NetworkError') ||
+          raw.includes('404') ||
+          raw.includes('Could not locate file')
+        ) {
+          friendly = `模型文件下载或定位失败（${raw}）。建议点击下方「改用国内镜像 (hf-mirror.com) 重试」。`;
+          failedStep = 'loading-model';
+        }
 
-      let completedSnapshot: MediaQueueItem | null = null;
-      setQueue((prev) =>
-        prev.map((q) => {
-          if (q.id !== item.id) return q;
-          completedSnapshot = {
-            ...q,
-            duration: duration || q.duration,
-            status: 'completed',
-            progress: 100,
-            stageText: '已完成',
-            streamingText: undefined,
-            chunks: normalizedChunks,
-            fullText: finalFullText,
-            modelUsed: cfg.localModelLoadedName || cfg.modelId,
-            languageUsed: cfg.language,
-            completedAt,
-            elapsedMs,
-          };
-          return completedSnapshot;
-        })
-      );
-
-      if (completedSnapshot) {
-        await saveTranscriptToDB(completedSnapshot);
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === jobId
+              ? {
+                  ...j,
+                  status: 'error',
+                  step: failedStep,
+                  progress: 0,
+                  statusText:
+                    failedStep === 'decoding'
+                      ? '音频提取失败'
+                      : failedStep === 'loading-model'
+                        ? '模型加载失败'
+                        : '语音识别出错',
+                  errorDetail: friendly,
+                }
+              : j
+          )
+        );
+      } finally {
+        setIsProcessing(false);
       }
-    } catch (err) {
-      if (stopRequestedRef.current) return;
-      const rawMsg = err instanceof Error ? err.message : String(err);
-      const friendlyMsg =
-        rawMsg.includes('local_files_only') || rawMsg.includes('Could not locate file')
-          ? '离线模式下未能找到完整的模型缓存文件，请先联网缓存该模型或导入本地模型文件夹。'
-          : rawMsg;
+    },
+    [cacheMap, isProcessing]
+  );
 
-      setQueue((prev) =>
-        prev.map((q) =>
-          q.id === item.id
-            ? {
-                ...q,
-                status: 'error',
-                progress: 0,
-                stageText: '处理失败',
-                errorMessage: friendlyMsg,
-              }
-            : q
-        )
-      );
-    }
-  }, [cacheMap]);
-
-  const handleStartBatch = useCallback(async () => {
-    if (isBatchRunning) return;
-    stopRequestedRef.current = false;
-    setIsBatchRunning(true);
-    setNoticeBanner(null);
-
-    const pendingIds = queueRef.current
-      .filter(
-        (item) =>
-          Boolean(item.file) &&
-          (item.status === 'queued' || item.status === 'cancelled' || item.status === 'error')
-      )
-      .map((i) => i.id);
-
-    for (const id of pendingIds) {
-      if (stopRequestedRef.current) break;
-      const latestItem = queueRef.current.find((q) => q.id === id);
-      if (!latestItem || !latestItem.file) continue;
-      setSelectedId(latestItem.id);
-      await runSingleItem(latestItem);
-    }
-
-    setIsBatchRunning(false);
-  }, [isBatchRunning, runSingleItem]);
-
-  const handleStopBatch = useCallback(() => {
+  const handleStopTranscribe = useCallback(() => {
     stopRequestedRef.current = true;
     for (const [, pending] of pendingTasksRef.current.entries()) {
-      pending.reject(new Error('用户已停止处理'));
+      pending.reject(new Error('已手动停止'));
     }
     pendingTasksRef.current.clear();
-
-    // Terminate active worker to halt WASM/WebGPU inference immediately, then respawn clean worker
     initWorker();
 
-    setQueue((prev) =>
-      prev.map((item) =>
-        item.status === 'decoding' || item.status === 'transcribing'
-          ? { ...item, status: 'cancelled', progress: 0, stageText: '已暂停' }
-          : item
+    setJobs((prev) =>
+      prev.map((j) =>
+        j.status === 'processing'
+          ? {
+              ...j,
+              status: 'cancelled',
+              step: 'idle',
+              progress: 0,
+              statusText: '已停止',
+              liveText: '',
+            }
+          : j
       )
     );
-    setIsBatchRunning(false);
+    setIsProcessing(false);
   }, [initWorker]);
 
-  const handleTranscribeSingle = useCallback(
-    async (id: string) => {
-      if (isBatchRunning) return;
-      const target = queueRef.current.find((q) => q.id === id);
-      if (!target || !target.file) return;
-      stopRequestedRef.current = false;
-      setIsBatchRunning(true);
-      setSelectedId(target.id);
-      await runSingleItem(target);
-      setIsBatchRunning(false);
+  const handleRetryWithMirror = useCallback(
+    (jobId: string) => {
+      const nextCfg: SpeechConfig = { ...configRef.current, downloadSource: 'hf-mirror' };
+      setConfig(nextCfg);
+      runTranscribeJob(jobId, nextCfg);
     },
-    [isBatchRunning, runSingleItem]
+    [runTranscribeJob]
   );
 
-  const handleRemoveItem = useCallback(
-    (id: string) => {
-      setQueue((prev) => {
-        const target = prev.find((q) => q.id === id);
-        if (target?.objectUrl) {
-          URL.revokeObjectURL(target.objectUrl);
-        }
-        return prev.filter((q) => q.id !== id);
-      });
-      deleteTranscriptFromDB(id);
-      setSelectedId((prev) => (prev === id ? null : prev));
+  const handleRetryWithWasm = useCallback(
+    (jobId: string) => {
+      const nextCfg: SpeechConfig = { ...configRef.current, device: 'wasm' };
+      setConfig(nextCfg);
+      runTranscribeJob(jobId, nextCfg);
     },
-    []
+    [runTranscribeJob]
   );
 
-  const handleClearCompleted = useCallback(() => {
-    setQueue((prev) => {
-      const remaining: MediaQueueItem[] = [];
-      for (const item of prev) {
-        if (item.status === 'completed') {
-          if (item.objectUrl) URL.revokeObjectURL(item.objectUrl);
-          deleteTranscriptFromDB(item.id);
-        } else {
-          remaining.push(item);
-        }
-      }
-      return remaining;
-    });
-  }, []);
-
-  const handleUpdateChunks = useCallback((itemId: string, nextChunks: SubtitleChunk[]) => {
-    const nextFullText = nextChunks.map((c) => c.text.trim()).join('\n');
-    let updatedItem: MediaQueueItem | null = null;
-    setQueue((prev) =>
-      prev.map((item) => {
-        if (item.id !== itemId) return item;
-        updatedItem = { ...item, chunks: nextChunks, fullText: nextFullText };
-        return updatedItem;
+  const handleUpdateText = useCallback((jobId: string, nextText: string) => {
+    let updated: TranscriptJob | null = null;
+    setJobs((prev) =>
+      prev.map((j) => {
+        if (j.id !== jobId) return j;
+        updated = { ...j, fullText: nextText };
+        return updated;
       })
     );
-    if (updatedItem) {
-      saveTranscriptToDB(updatedItem);
+    if (updated && (updated as TranscriptJob).status === 'completed') {
+      saveTranscriptToDB(updated);
     }
   }, []);
 
-  const handleExportSingleSrt = useCallback(
-    (item: MediaQueueItem) => {
-      const srt = generateSrt(item.chunks, { maxLineChars: exportSettings.srtMaxLineChars });
-      downloadTextFile(
-        srt,
-        `${getBaseFileName(item.fileName)}.srt`,
-        exportSettings.srtIncludeBom
-      );
-    },
-    [exportSettings]
-  );
+  const handleExportTxt = useCallback((job: TranscriptJob, includeTimestamps: boolean) => {
+    const content =
+      includeTimestamps && job.segments.length > 0
+        ? formatSegmentsText(job.segments, job.fullText, true)
+        : job.fullText;
+    if (!content.trim()) return;
+    downloadTxtFile(content.trim() + '\n', `${getBaseFileName(job.fileName)}.txt`);
+  }, []);
 
-  const handleExportSingleTxt = useCallback(
-    (item: MediaQueueItem) => {
-      const txt = generateTxt(item.chunks, item.fullText, {
-        mode: exportSettings.txtMode,
-        title: exportSettings.txtIncludeTitle ? item.fileName : undefined,
-      });
-      downloadTextFile(
-        txt,
-        `${getBaseFileName(item.fileName)}.txt`,
-        exportSettings.srtIncludeBom
-      );
-    },
-    [exportSettings]
-  );
-
-  const handleBatchExportZip = useCallback(
-    async (format: 'srt' | 'txt' | 'both') => {
-      const targets = queue.filter((i) => i.status === 'completed' && i.selectedForExport);
-      if (targets.length === 0) return;
-      await exportBatchAsZip(targets, format, exportSettings);
-    },
-    [queue, exportSettings]
-  );
-
-  const handleBatchExportMergedTxt = useCallback(() => {
-    const targets = queue.filter((i) => i.status === 'completed' && i.selectedForExport);
-    if (targets.length === 0) return;
-    exportMergedTxt(targets, exportSettings);
-  }, [queue, exportSettings]);
+  const handleRemoveJob = useCallback((id: string) => {
+    setJobs((prev) => {
+      const target = prev.find((j) => j.id === id);
+      if (target?.objectUrl) URL.revokeObjectURL(target.objectUrl);
+      const next = prev.filter((j) => j.id !== id);
+      setActiveJobId((curr) => (curr === id ? (next[0]?.id ?? null) : curr));
+      return next;
+    });
+    deleteTranscriptFromDB(id);
+  }, []);
 
   const handlePreloadModel = useCallback(
     (modelId?: WhisperModelId) => {
       const targetId = modelId ?? config.modelId;
-      setNoticeBanner(null);
+      setBanner(null);
       setDownloadState({
         modelId: targetId,
         status: 'downloading',
         progress: 0,
         loadedBytes: 0,
         totalBytes: 0,
-        currentFile: '连接模型资源...',
+        currentFile: '连接模型源...',
       });
       workerRef.current?.postMessage({
         type: 'preload-model',
         modelId: targetId,
         device: config.device,
-        remoteHost: config.remoteHost,
+        remoteHost: resolveRemoteHost(config),
         offlineOnly: config.offlineOnly,
       });
     },
@@ -727,10 +656,7 @@ export default function App() {
     async (modelId: WhisperModelId) => {
       await clearModelCache(modelId);
       await refreshCacheStatus();
-      setNoticeBanner({
-        type: 'info',
-        message: `已清除 ${modelId} 的本地缓存。`,
-      });
+      setBanner({ type: 'info', message: `已清除 ${modelId} 本地缓存。` });
     },
     [refreshCacheStatus]
   );
@@ -749,15 +675,15 @@ export default function App() {
     const hasConfig = entries.some((e) => e.relativePath.endsWith('config.json'));
     const hasOnnx = entries.some((e) => e.relativePath.endsWith('.onnx'));
     if (!hasConfig || !hasOnnx) {
-      setNoticeBanner({
+      setBanner({
         type: 'error',
-        message: '所选文件夹缺少 config.json 或 .onnx 模型文件，请确认选择的是有效的 ONNX Whisper 模型目录。',
+        message: '所选文件夹缺少 config.json 或 .onnx 文件，请选择完整的 Whisper ONNX 模型目录。',
       });
       return;
     }
 
     localModelFilesRef.current = { name: folderName, files: entries };
-    setConfig((prev) => ({ ...prev, localModelLoadedName: folderName }));
+    setConfig((prev) => ({ ...prev, localModelName: folderName }));
     workerRef.current?.postMessage({
       type: 'register-local-model',
       modelName: folderName,
@@ -767,33 +693,14 @@ export default function App() {
 
   const handleClearLocalModelFolder = useCallback(() => {
     localModelFilesRef.current = null;
-    setConfig((prev) => ({ ...prev, localModelLoadedName: null }));
+    setConfig((prev) => ({ ...prev, localModelName: null }));
     workerRef.current?.postMessage({ type: 'clear-local-model' });
   }, []);
 
-  const selectedItem = useMemo(
-    () => queue.find((q) => q.id === selectedId) ?? null,
-    [queue, selectedId]
+  const activeJob = useMemo(
+    () => jobs.find((j) => j.id === activeJobId) ?? null,
+    [jobs, activeJobId]
   );
-
-  const stats = useMemo(() => {
-    let completedFiles = 0;
-    let totalDuration = 0;
-    let totalCharacters = 0;
-    for (const item of queue) {
-      totalDuration += item.duration || 0;
-      if (item.status === 'completed') {
-        completedFiles++;
-        totalCharacters += item.fullText.replace(/\s+/g, '').length;
-      }
-    }
-    return {
-      totalFiles: queue.length,
-      completedFiles,
-      totalDuration,
-      totalCharacters,
-    };
-  }, [queue]);
 
   return (
     <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -811,24 +718,23 @@ export default function App() {
         }}
       />
 
-      <TopHeader
+      <TopBar
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         onOpenFilePicker={() => globalFilePickerRef.current?.click()}
       />
 
-      {/* Mobile Navigation Sub-bar */}
+      {/* Mobile Navigation */}
       <nav
         aria-label="移动端导航"
-        className="flex items-center gap-1 overflow-x-auto border-b border-slate-200 bg-white px-4 py-1.5 md:hidden dark:border-slate-800 dark:bg-slate-900"
+        className="flex items-center gap-2 border-b border-slate-200 bg-white px-4 py-1.5 md:hidden dark:border-slate-800 dark:bg-slate-900"
       >
         {(
           [
-            { id: 'workspace', label: '转录工作台' },
-            { id: 'models', label: '离线模型库' },
-            { id: 'formats', label: '导出规范' },
-            { id: 'privacy', label: '隐私与说明' },
-          ] as Array<{ id: ActiveNavTab; label: string }>
+            { id: 'workspace', label: '语音转文字' },
+            { id: 'models', label: '离线模型' },
+            { id: 'guide', label: '使用说明' },
+          ] as Array<{ id: ActiveTab; label: string }>
         ).map((tab) => (
           <button
             key={tab.id}
@@ -845,20 +751,19 @@ export default function App() {
         ))}
       </nav>
 
-      {/* Notice Banner (errors or model mount feedback) */}
-      {noticeBanner && (
+      {banner && (
         <div
           role="status"
           className={`flex items-center justify-between gap-4 border-b px-6 py-2.5 text-xs ${
-            noticeBanner.type === 'error'
+            banner.type === 'error'
               ? 'border-red-200 bg-red-50 text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300'
               : 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900/50 dark:bg-blue-950/40 dark:text-blue-300'
           }`}
         >
-          <span>{noticeBanner.message}</span>
+          <span>{banner.message}</span>
           <button
             type="button"
-            onClick={() => setNoticeBanner(null)}
+            onClick={() => setBanner(null)}
             className="font-medium underline shrink-0"
           >
             关闭
@@ -866,10 +771,9 @@ export default function App() {
         </div>
       )}
 
-      {/* Main View */}
       {activeTab === 'workspace' && (
         <main className="flex flex-1 flex-col lg:h-[calc(100vh-3.5rem)] lg:flex-row lg:overflow-hidden">
-          <SidebarConfig
+          <ConfigSidebar
             config={config}
             onChangeConfig={(patch) => setConfig((prev) => ({ ...prev, ...patch }))}
             webgpuSupported={webgpuSupported}
@@ -882,64 +786,34 @@ export default function App() {
             isOnline={isOnline}
             theme={theme}
             onToggleTheme={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-            stats={stats}
           />
 
-          <div className="flex flex-1 flex-col overflow-hidden lg:flex-row">
-            <BatchQueuePane
-              items={queue}
-              selectedId={selectedId}
-              isBatchRunning={isBatchRunning}
-              onSelectItem={setSelectedId}
-              onAddFiles={handleAddFiles}
-              onStartAll={handleStartBatch}
-              onStopBatch={handleStopBatch}
-              onTranscribeSingle={handleTranscribeSingle}
-              onRemoveItem={handleRemoveItem}
-              onClearCompleted={handleClearCompleted}
-              onToggleSelectForExport={(id) =>
-                setQueue((prev) =>
-                  prev.map((q) =>
-                    q.id === id ? { ...q, selectedForExport: !q.selectedForExport } : q
-                  )
-                )
-              }
-              onToggleSelectAllForExport={(checked) =>
-                setQueue((prev) =>
-                  prev.map((q) =>
-                    q.status === 'completed' ? { ...q, selectedForExport: checked } : q
-                  )
-                )
-              }
-              onExportSingleSrt={handleExportSingleSrt}
-              onExportSingleTxt={handleExportSingleTxt}
-              onBatchExportZip={handleBatchExportZip}
-              onBatchExportMergedTxt={handleBatchExportMergedTxt}
-              onRelinkFile={handleRelinkFile}
-            />
-
-            <TranscriptInspector
-              item={selectedItem}
-              exportSettings={exportSettings}
-              onChangeExportSettings={(patch) =>
-                setExportSettings((prev) => ({ ...prev, ...patch }))
-              }
-              onUpdateChunks={handleUpdateChunks}
-              onExportSrt={handleExportSingleSrt}
-              onExportTxt={handleExportSingleTxt}
-            />
-          </div>
+          <SpeechWorkspace
+            jobs={jobs}
+            activeJob={activeJob}
+            isProcessing={isProcessing}
+            onSelectJob={setActiveJobId}
+            onAddFiles={handleAddFiles}
+            onRelinkFile={handleRelinkFile}
+            onStartTranscribe={(id) => runTranscribeJob(id)}
+            onStopTranscribe={handleStopTranscribe}
+            onRetryWithMirror={handleRetryWithMirror}
+            onRetryWithWasm={handleRetryWithWasm}
+            onUpdateText={handleUpdateText}
+            onExportTxt={handleExportTxt}
+            onRemoveJob={handleRemoveJob}
+          />
         </main>
       )}
 
       {activeTab === 'models' && (
-        <main className="flex-1">
-          <ModelsManagerView
+        <main className="flex-1 overflow-y-auto">
+          <ModelsView
             config={config}
             onChangeConfig={(patch) => setConfig((prev) => ({ ...prev, ...patch }))}
             cacheMap={cacheMap}
             downloadState={downloadState}
-            onPreloadSpecificModel={(id) => handlePreloadModel(id)}
+            onPreloadModel={(id) => handlePreloadModel(id)}
             onDeleteModelCache={handleDeleteModelCache}
             onSelectLocalModelFolder={handleSelectLocalModelFolder}
             onClearLocalModelFolder={handleClearLocalModelFolder}
@@ -947,20 +821,9 @@ export default function App() {
         </main>
       )}
 
-      {activeTab === 'formats' && (
-        <main className="flex-1">
-          <FormatGuideView
-            settings={exportSettings}
-            onChangeSettings={(patch) =>
-              setExportSettings((prev) => ({ ...prev, ...patch }))
-            }
-          />
-        </main>
-      )}
-
-      {activeTab === 'privacy' && (
-        <main className="flex-1">
-          <PrivacyGuideView />
+      {activeTab === 'guide' && (
+        <main className="flex-1 overflow-y-auto">
+          <GuideView />
         </main>
       )}
     </div>

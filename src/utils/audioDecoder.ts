@@ -84,6 +84,44 @@ export function probeMediaDurationFromUrl(
   });
 }
 
+function downmixToMono(audioBuffer: AudioBuffer): Float32Array {
+  const { numberOfChannels, length } = audioBuffer;
+  if (numberOfChannels === 1) {
+    return new Float32Array(audioBuffer.getChannelData(0));
+  }
+  const mono = new Float32Array(length);
+  for (let ch = 0; ch < numberOfChannels; ch++) {
+    const channelData = audioBuffer.getChannelData(ch);
+    for (let i = 0; i < length; i++) {
+      mono[i] += channelData[i];
+    }
+  }
+  const inv = 1 / numberOfChannels;
+  for (let i = 0; i < length; i++) {
+    mono[i] *= inv;
+  }
+  return mono;
+}
+
+function linearResample(
+  input: Float32Array,
+  fromSampleRate: number,
+  toSampleRate: number
+): Float32Array {
+  if (fromSampleRate === toSampleRate) return input;
+  const ratio = fromSampleRate / toSampleRate;
+  const outputLength = Math.max(1, Math.floor(input.length / ratio));
+  const output = new Float32Array(outputLength);
+  for (let i = 0; i < outputLength; i++) {
+    const srcPos = i * ratio;
+    const idx0 = Math.floor(srcPos);
+    const idx1 = Math.min(input.length - 1, idx0 + 1);
+    const frac = srcPos - idx0;
+    output[i] = input[idx0] * (1 - frac) + input[idx1] * frac;
+  }
+  return output;
+}
+
 export interface DecodedAudioResult {
   audioData: Float32Array;
   duration: number;
@@ -91,7 +129,7 @@ export interface DecodedAudioResult {
 }
 
 /**
- * Decodes any browser-supported audio or video file locally inside the browser
+ * Decodes any browser-supported audio or video file locally in memory
  * and resamples its audio track to 16kHz mono Float32Array for Whisper inference.
  */
 export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResult> {
@@ -107,10 +145,10 @@ export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResu
       msg.toLowerCase().includes('could not be read')
     ) {
       throw new Error(
-        '文件读取失败（权限失效或文件过大超出浏览器单次读取上限）。请确保文件位于本地硬盘且未被占用，大视频建议先提取 MP3/WAV 音轨或分段处理，然后点击「重新选择」。'
+        '无法读取本地文件（文件句柄权限已过期或被占用）。请点击「重新选择文件」再次导入该媒体文件。'
       );
     }
-    throw new Error(`无法读取文件数据：${msg}`);
+    throw new Error(`文件读取失败：${msg}`);
   }
 
   const AudioCtx =
@@ -118,7 +156,7 @@ export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResu
     (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
 
   if (!AudioCtx) {
-    throw new Error('当前浏览器不支持 Web Audio API，无法本地解码音视频。');
+    throw new Error('当前浏览器不支持 Web Audio API，无法在本地提取音轨。');
   }
 
   const audioCtx = new AudioCtx();
@@ -128,37 +166,44 @@ export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResu
     decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
   } catch {
     throw new Error(
-      '无法解码该文件的音轨。请确认文件未损坏且包含音轨，或使用标准编码（MP4/MOV/WebM/MP3/WAV/M4A/FLAC/OGG）。'
+      '浏览器无法直接解码该文件的音轨。请确认文件未损坏且包含音频轨道（建议 MP3、WAV、M4A、OGG、WebM 或标准 H.264+AAC MP4）。'
     );
   } finally {
     await audioCtx.close().catch(() => {});
   }
 
   const duration = decodedBuffer.duration;
-  const targetLength = Math.max(1, Math.ceil(duration * TARGET_SAMPLE_RATE));
+  const monoSource = downmixToMono(decodedBuffer);
 
-  // If already 16kHz mono, avoid an extra OfflineAudioContext pass
-  if (decodedBuffer.sampleRate === TARGET_SAMPLE_RATE && decodedBuffer.numberOfChannels === 1) {
-    const channelData = new Float32Array(decodedBuffer.getChannelData(0));
+  if (decodedBuffer.sampleRate === TARGET_SAMPLE_RATE) {
     return {
-      audioData: channelData,
+      audioData: monoSource,
       duration,
       sampleRate: TARGET_SAMPLE_RATE,
     };
   }
 
-  const offlineCtx = new OfflineAudioContext(1, targetLength, TARGET_SAMPLE_RATE);
-  const source = offlineCtx.createBufferSource();
-  source.buffer = decodedBuffer;
-  source.connect(offlineCtx.destination);
-  source.start(0);
-
-  const renderedBuffer = await offlineCtx.startRendering();
-  const monoData = new Float32Array(renderedBuffer.getChannelData(0));
-
-  return {
-    audioData: monoData,
-    duration,
-    sampleRate: TARGET_SAMPLE_RATE,
-  };
+  // Use OfflineAudioContext for high-quality anti-aliased resampling, with linear fallback on memory limits
+  try {
+    const targetLength = Math.max(1, Math.ceil(duration * TARGET_SAMPLE_RATE));
+    const offlineCtx = new OfflineAudioContext(1, targetLength, TARGET_SAMPLE_RATE);
+    const monoBuffer = offlineCtx.createBuffer(1, monoSource.length, decodedBuffer.sampleRate);
+    monoBuffer.getChannelData(0).set(monoSource);
+    const source = offlineCtx.createBufferSource();
+    source.buffer = monoBuffer;
+    source.connect(offlineCtx.destination);
+    source.start(0);
+    const rendered = await offlineCtx.startRendering();
+    return {
+      audioData: new Float32Array(rendered.getChannelData(0)),
+      duration,
+      sampleRate: TARGET_SAMPLE_RATE,
+    };
+  } catch {
+    return {
+      audioData: linearResample(monoSource, decodedBuffer.sampleRate, TARGET_SAMPLE_RATE),
+      duration,
+      sampleRate: TARGET_SAMPLE_RATE,
+    };
+  }
 }
