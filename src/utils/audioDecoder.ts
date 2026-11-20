@@ -1,4 +1,7 @@
+import { MPEGDecoder } from 'mpg123-decoder';
+
 const TARGET_SAMPLE_RATE = 16000;
+const MP3_CHUNK_BYTES = 2 * 1024 * 1024; // 2 MB per streaming slice
 
 const VIDEO_EXTENSIONS = new Set([
   'mp4',
@@ -103,7 +106,75 @@ function downmixToMono(audioBuffer: AudioBuffer): Float32Array {
   return mono;
 }
 
-function linearResample(
+/**
+ * Downmixes multi-channel Float32 arrays and resamples to 16kHz Int16 PCM
+ * using anti-aliased box-averaging (for downsampling) or linear interpolation.
+ */
+function downmixAndResampleTo16kInt16(
+  channels: Float32Array[],
+  samplesCount: number,
+  fromSampleRate: number
+): Int16Array {
+  const chCount = channels.length;
+  if (samplesCount <= 0 || chCount === 0 || fromSampleRate <= 0) {
+    return new Int16Array(0);
+  }
+
+  const ratio = fromSampleRate / TARGET_SAMPLE_RATE;
+  const outputLength = Math.max(1, Math.floor(samplesCount / ratio));
+  const out = new Int16Array(outputLength);
+
+  const left = channels[0];
+  const right = chCount > 1 ? channels[1] : null;
+
+  if (ratio >= 1.5) {
+    // Anti-aliased bin averaging for downsampling (e.g. 44.1kHz/48kHz -> 16kHz)
+    for (let i = 0; i < outputLength; i++) {
+      const start = Math.floor(i * ratio);
+      const end = Math.min(samplesCount, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+      let sum = 0;
+      if (right && chCount === 2) {
+        for (let j = start; j < end; j++) {
+          sum += (left[j] + right[j]) * 0.5;
+        }
+      } else if (chCount > 2) {
+        for (let j = start; j < end; j++) {
+          let chSum = 0;
+          for (let c = 0; c < chCount; c++) chSum += channels[c][j];
+          sum += chSum / chCount;
+        }
+      } else {
+        for (let j = start; j < end; j++) {
+          sum += left[j];
+        }
+      }
+      const val = sum / (end - start);
+      const clamped = val < -1 ? -1 : val > 1 ? 1 : val;
+      out[i] = clamped < 0 ? clamped * 32768 : clamped * 32767;
+    }
+  } else {
+    // Linear interpolation when sampleRate <= 24kHz
+    for (let i = 0; i < outputLength; i++) {
+      const srcPos = i * ratio;
+      const idx0 = Math.floor(srcPos);
+      const idx1 = Math.min(samplesCount - 1, idx0 + 1);
+      const frac = srcPos - idx0;
+      let v0 = left[idx0];
+      let v1 = left[idx1];
+      if (right && chCount === 2) {
+        v0 = (v0 + right[idx0]) * 0.5;
+        v1 = (v1 + right[idx1]) * 0.5;
+      }
+      const val = v0 * (1 - frac) + v1 * frac;
+      const clamped = val < -1 ? -1 : val > 1 ? 1 : val;
+      out[i] = clamped < 0 ? clamped * 32768 : clamped * 32767;
+    }
+  }
+
+  return out;
+}
+
+function linearResampleFloat32(
   input: Float32Array,
   fromSampleRate: number,
   toSampleRate: number
@@ -128,100 +199,129 @@ export interface DecodedAudioResult {
   sampleRate: number;
 }
 
+export type DecodeProgressCallback = (progressPct: number, detail: string) => void;
+
 /**
- * Fallback decoder using HTML5 Audio element + MediaStreamDestination for large or VBR MP3 files
- * whose headers cause AudioContext.decodeAudioData to fail.
+ * Streaming MP3 decoder using libmpg123 WASM in 2 MB file slices.
+ * Keeps peak RAM tiny even for 150MB-500MB+ MP3 files instead of triggering
+ * Chromium's 2GB AudioContext.decodeAudioData allocation ceiling.
  */
-async function decodeViaHtmlAudioFallback(file: File): Promise<DecodedAudioResult> {
-  const url = URL.createObjectURL(file);
-  const audio = document.createElement('audio');
-  audio.src = url;
-  audio.crossOrigin = 'anonymous';
-  audio.muted = true;
-  audio.preload = 'auto';
+async function decodeMp3Streaming(
+  file: File,
+  onProgress?: DecodeProgressCallback
+): Promise<DecodedAudioResult> {
+  const decoder = new MPEGDecoder();
+  await decoder.ready;
+
+  const pcm16Chunks: Array<Int16Array | null> = [];
+  let totalSamples16k = 0;
+  let offset = 0;
+  const totalBytes = file.size;
 
   try {
-    await new Promise((resolve, reject) => {
-      audio.onloadedmetadata = () => resolve(true);
-      audio.onerror = () => reject(new Error('HTML5 audio element could not load media'));
-      audio.load();
-    });
-
-    const duration = audio.duration;
-    if (!Number.isFinite(duration) || duration <= 0) {
-      throw new Error('Invalid media duration');
-    }
-
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const audioCtx = new AudioCtx({ sampleRate: TARGET_SAMPLE_RATE });
-    const source = audioCtx.createMediaElementSource(audio);
-    const dest = audioCtx.createMediaStreamDestination();
-    source.connect(dest);
-
-    const mediaRecorder = new MediaRecorder(dest.stream, {
-      mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=pcm')
-        ? 'audio/webm;codecs=pcm'
-        : MediaRecorder.isTypeSupported('audio/webm')
-          ? 'audio/webm'
-          : '',
-    });
-
-    const chunks: Blob[] = [];
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) chunks.push(e.data);
-    };
-
-    const recordingDone = new Promise<Float32Array>((resolve, reject) => {
-      mediaRecorder.onstop = async () => {
-        try {
-          const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-          const ab = await blob.arrayBuffer();
-          const decoded = await audioCtx.decodeAudioData(ab);
-          resolve(downmixToMono(decoded));
-        } catch (err) {
-          reject(err);
+    while (offset < totalBytes) {
+      const end = Math.min(totalBytes, offset + MP3_CHUNK_BYTES);
+      let sliceBuf: ArrayBuffer;
+      try {
+        sliceBuf = await file.slice(offset, end).arrayBuffer();
+      } catch (err) {
+        const name = err instanceof Error ? err.name : '';
+        const msg = err instanceof Error ? err.message : String(err);
+        if (
+          name === 'NotReadableError' ||
+          msg.toLowerCase().includes('permission') ||
+          msg.toLowerCase().includes('could not be read')
+        ) {
+          throw new Error(
+            '无法读取本地文件（文件句柄权限已过期或被占用）。请点击「重新选择文件」再次导入该媒体文件。'
+          );
         }
-      };
-      audio.onended = () => {
-        if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-      };
-      audio.onerror = () => {
-        if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-        reject(new Error('Audio playback error during fallback decode'));
-      };
-    });
+        throw new Error(`文件读取失败：${msg}`);
+      }
 
-    mediaRecorder.start(250);
-    audio.playbackRate = 4.0; // 4x speedup for fast background decoding
-    await audio.play();
+      const decoded = decoder.decode(new Uint8Array(sliceBuf));
+      if (decoded.samplesDecoded > 0 && decoded.sampleRate > 0) {
+        const chunk16k = downmixAndResampleTo16kInt16(
+          decoded.channelData,
+          decoded.samplesDecoded,
+          decoded.sampleRate
+        );
+        if (chunk16k.length > 0) {
+          pcm16Chunks.push(chunk16k);
+          totalSamples16k += chunk16k.length;
+        }
+      }
 
-    const audioData = await recordingDone;
-    await audioCtx.close().catch(() => {});
+      offset = end;
+      if (onProgress) {
+        const pct = Math.min(99, Math.round((offset / totalBytes) * 100));
+        onProgress(pct, `正在流式解码 MP3 音轨 (${pct}%)`);
+      }
 
-    // Resample to exact target sample rate if needed
-    const finalData = audioCtx.sampleRate === TARGET_SAMPLE_RATE 
-      ? audioData 
-      : linearResample(audioData, audioCtx.sampleRate, TARGET_SAMPLE_RATE);
-
-    return {
-      audioData: finalData,
-      duration,
-      sampleRate: TARGET_SAMPLE_RATE,
-    };
+      // Yield briefly to keep UI responsive during large MP3 decoding
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
   } finally {
-    audio.pause();
-    audio.removeAttribute('src');
-    URL.revokeObjectURL(url);
+    try {
+      decoder.free();
+    } catch {
+      // ignore cleanup error
+    }
   }
+
+  if (totalSamples16k === 0) {
+    throw new Error('MP3_NO_SAMPLES');
+  }
+
+  const audioData = new Float32Array(totalSamples16k);
+  let writeOffset = 0;
+  for (let i = 0; i < pcm16Chunks.length; i++) {
+    const chunk = pcm16Chunks[i];
+    if (!chunk) continue;
+    for (let j = 0; j < chunk.length; j++) {
+      audioData[writeOffset + j] = chunk[j] / 32768;
+    }
+    writeOffset += chunk.length;
+    pcm16Chunks[i] = null; // allow GC immediately
+  }
+
+  return {
+    audioData,
+    duration: totalSamples16k / TARGET_SAMPLE_RATE,
+    sampleRate: TARGET_SAMPLE_RATE,
+  };
 }
 
 /**
  * Decodes any browser-supported audio or video file locally in memory
  * and resamples its audio track to 16kHz mono Float32Array for Whisper inference.
  */
-export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResult> {
+export async function decodeMediaTo16kMono(
+  file: File,
+  onProgress?: DecodeProgressCallback
+): Promise<DecodedAudioResult> {
+  const ext = getFileExtension(file.name);
+  const isMp3 =
+    ext === 'mp3' ||
+    file.type === 'audio/mpeg' ||
+    file.type === 'audio/mp3' ||
+    file.type === 'audio/x-mpeg';
+
+  if (isMp3) {
+    try {
+      return await decodeMp3Streaming(file, onProgress);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg !== 'MP3_NO_SAMPLES') {
+        throw err;
+      }
+      // Fall through to AudioContext in case a non-MP3 file was misnamed .mp3
+    }
+  }
+
   let arrayBuffer: ArrayBuffer;
   try {
+    onProgress?.(20, '正在读取媒体文件...');
     arrayBuffer = await file.arrayBuffer();
   } catch (err) {
     const name = err instanceof Error ? err.name : '';
@@ -246,24 +346,27 @@ export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResu
     throw new Error('当前浏览器不支持 Web Audio API，无法在本地提取音轨。');
   }
 
+  onProgress?.(55, '正在解码音频轨道...');
   const audioCtx = new AudioCtx();
-  let decodedBuffer: AudioBuffer | null = null;
+  let decodedBuffer: AudioBuffer;
 
   try {
     decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
   } catch {
-    // decodeAudioData failed (often due to VBR MP3 headers, missing duration, or large size).
-    // Try robust HTML5 Audio element streaming fallback:
-    await audioCtx.close().catch(() => {});
-    return await decodeViaHtmlAudioFallback(file);
+    const sizeMb = Math.round(file.size / (1024 * 1024));
+    if (['mkv', 'avi', 'flv', 'wmv'].includes(ext)) {
+      throw new Error(
+        `该 ${sizeMb}MB 的 .${ext} 文件可能使用了浏览器内核不支持的音轨编码（如 AC3/DTS）。建议转为 MP3 后再导入。`
+      );
+    }
+    throw new Error(
+      `浏览器原生解码器无法一次解开该 ${sizeMb}MB 文件（可能超出浏览器单次解码内存上限或音轨编码不受支持）。建议先用音频工具转为标准 MP3 格式后再导入，即可支持流式分片解码。`
+    );
   } finally {
     await audioCtx.close().catch(() => {});
   }
 
-  if (!decodedBuffer) {
-    return await decodeViaHtmlAudioFallback(file);
-  }
-
+  onProgress?.(85, '正在重采样为 16kHz 单声道...');
   const duration = decodedBuffer.duration;
   const monoSource = downmixToMono(decodedBuffer);
 
@@ -275,7 +378,6 @@ export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResu
     };
   }
 
-  // Use OfflineAudioContext for high-quality anti-aliased resampling, with linear fallback on memory limits
   try {
     const targetLength = Math.max(1, Math.ceil(duration * TARGET_SAMPLE_RATE));
     const offlineCtx = new OfflineAudioContext(1, targetLength, TARGET_SAMPLE_RATE);
@@ -293,7 +395,7 @@ export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResu
     };
   } catch {
     return {
-      audioData: linearResample(monoSource, decodedBuffer.sampleRate, TARGET_SAMPLE_RATE),
+      audioData: linearResampleFloat32(monoSource, decodedBuffer.sampleRate, TARGET_SAMPLE_RATE),
       duration,
       sampleRate: TARGET_SAMPLE_RATE,
     };

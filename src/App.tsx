@@ -437,7 +437,23 @@ export default function App() {
       let failedStep: 'decoding' | 'loading-model' | 'transcribing' = 'decoding';
 
       try {
-        const { audioData, duration } = await decodeMediaTo16kMono(target.file);
+        const { audioData, duration } = await decodeMediaTo16kMono(
+          target.file,
+          (pct, detail) => {
+            if (stopRequestedRef.current) return;
+            setJobs((prev) =>
+              prev.map((j) =>
+                j.id === jobId && j.status === 'processing' && j.step === 'decoding'
+                  ? {
+                      ...j,
+                      progress: Math.max(2, Math.min(9, Math.round(pct * 0.09))),
+                      statusText: detail,
+                    }
+                  : j
+              )
+            );
+          }
+        );
         if (stopRequestedRef.current) return;
 
         failedStep = 'loading-model';
