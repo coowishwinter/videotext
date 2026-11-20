@@ -129,6 +129,93 @@ export interface DecodedAudioResult {
 }
 
 /**
+ * Fallback decoder using HTML5 Audio element + MediaStreamDestination for large or VBR MP3 files
+ * whose headers cause AudioContext.decodeAudioData to fail.
+ */
+async function decodeViaHtmlAudioFallback(file: File): Promise<DecodedAudioResult> {
+  const url = URL.createObjectURL(file);
+  const audio = document.createElement('audio');
+  audio.src = url;
+  audio.crossOrigin = 'anonymous';
+  audio.muted = true;
+  audio.preload = 'auto';
+
+  try {
+    await new Promise((resolve, reject) => {
+      audio.onloadedmetadata = () => resolve(true);
+      audio.onerror = () => reject(new Error('HTML5 audio element could not load media'));
+      audio.load();
+    });
+
+    const duration = audio.duration;
+    if (!Number.isFinite(duration) || duration <= 0) {
+      throw new Error('Invalid media duration');
+    }
+
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const audioCtx = new AudioCtx({ sampleRate: TARGET_SAMPLE_RATE });
+    const source = audioCtx.createMediaElementSource(audio);
+    const dest = audioCtx.createMediaStreamDestination();
+    source.connect(dest);
+
+    const mediaRecorder = new MediaRecorder(dest.stream, {
+      mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=pcm')
+        ? 'audio/webm;codecs=pcm'
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : '',
+    });
+
+    const chunks: Blob[] = [];
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+
+    const recordingDone = new Promise<Float32Array>((resolve, reject) => {
+      mediaRecorder.onstop = async () => {
+        try {
+          const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+          const ab = await blob.arrayBuffer();
+          const decoded = await audioCtx.decodeAudioData(ab);
+          resolve(downmixToMono(decoded));
+        } catch (err) {
+          reject(err);
+        }
+      };
+      audio.onended = () => {
+        if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      };
+      audio.onerror = () => {
+        if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+        reject(new Error('Audio playback error during fallback decode'));
+      };
+    });
+
+    mediaRecorder.start(250);
+    audio.playbackRate = 4.0; // 4x speedup for fast background decoding
+    await audio.play();
+
+    const audioData = await recordingDone;
+    await audioCtx.close().catch(() => {});
+
+    // Resample to exact target sample rate if needed
+    const finalData = audioCtx.sampleRate === TARGET_SAMPLE_RATE 
+      ? audioData 
+      : linearResample(audioData, audioCtx.sampleRate, TARGET_SAMPLE_RATE);
+
+    return {
+      audioData: finalData,
+      duration,
+      sampleRate: TARGET_SAMPLE_RATE,
+    };
+  } finally {
+    audio.pause();
+    audio.removeAttribute('src');
+    URL.revokeObjectURL(url);
+  }
+}
+
+/**
  * Decodes any browser-supported audio or video file locally in memory
  * and resamples its audio track to 16kHz mono Float32Array for Whisper inference.
  */
@@ -160,16 +247,21 @@ export async function decodeMediaTo16kMono(file: File): Promise<DecodedAudioResu
   }
 
   const audioCtx = new AudioCtx();
-  let decodedBuffer: AudioBuffer;
+  let decodedBuffer: AudioBuffer | null = null;
 
   try {
     decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
   } catch {
-    throw new Error(
-      '浏览器无法直接解码该文件的音轨。请确认文件未损坏且包含音频轨道（建议 MP3、WAV、M4A、OGG、WebM 或标准 H.264+AAC MP4）。'
-    );
+    // decodeAudioData failed (often due to VBR MP3 headers, missing duration, or large size).
+    // Try robust HTML5 Audio element streaming fallback:
+    await audioCtx.close().catch(() => {});
+    return await decodeViaHtmlAudioFallback(file);
   } finally {
     await audioCtx.close().catch(() => {});
+  }
+
+  if (!decodedBuffer) {
+    return await decodeViaHtmlAudioFallback(file);
   }
 
   const duration = decodedBuffer.duration;
