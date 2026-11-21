@@ -130,8 +130,9 @@ export const ConfigSidebar: React.FC<ConfigSidebarProps> = ({
               }
               className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
             >
-              <option value="huggingface">HuggingFace 官方源</option>
+              <option value="auto-fallback">智能多镜像自动回退（推荐 · 免魔法）</option>
               <option value="hf-mirror">国内镜像加速 (hf-mirror.com)</option>
+              <option value="huggingface">HuggingFace 官方源</option>
               <option value="custom">自定义镜像地址</option>
             </select>
             {config.downloadSource === 'custom' && (

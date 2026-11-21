@@ -76,11 +76,12 @@ export const MODEL_OPTIONS: ModelOption[] = [
   },
 ];
 
-export type DownloadSource = 'huggingface' | 'hf-mirror' | 'custom';
+export type DownloadSource = 'huggingface' | 'hf-mirror' | 'auto-fallback' | 'custom';
 
-export const DOWNLOAD_SOURCE_HOSTS: Record<'huggingface' | 'hf-mirror', string> = {
+export const DOWNLOAD_SOURCE_HOSTS: Record<string, string> = {
   huggingface: 'https://huggingface.co/',
   'hf-mirror': 'https://hf-mirror.com/',
+  'auto-fallback': 'https://hf-mirror.com/',
 };
 
 export type InferenceDevice = 'auto' | 'webgpu' | 'wasm';

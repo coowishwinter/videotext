@@ -122,34 +122,64 @@ function configureEnvironment(remoteHost: string, offlineOnly: boolean, useLocal
     env.remoteHost = normalized;
   }
 
-  if (useLocalFolder && localFilesMap.size > 0) {
-    env.fetch = async (input: string | URL, init?: RequestInit) => {
-      const urlStr = typeof input === 'string' ? input : input.toString();
-      if (urlStr.includes(LOCAL_MODEL_VIRTUAL_ID)) {
-        const marker = '/resolve/main/';
-        const markerIdx = urlStr.indexOf(marker);
-        let relPath = markerIdx >= 0 ? urlStr.slice(markerIdx + marker.length) : urlStr;
-        relPath = relPath.split('?')[0].replace(/^\/+/, '');
+  const mirrorHosts = ['https://hf-mirror.com/', 'https://huggingface.co/'];
 
-        const matchedFile = findLocalFile(relPath);
-        if (matchedFile) {
-          return new Response(matchedFile, {
-            status: 200,
-            headers: {
-              'content-length': String(matchedFile.size),
-              'content-type': relPath.endsWith('.json')
-                ? 'application/json'
-                : 'application/octet-stream',
-            },
-          });
-        }
-        return new Response('Local model file not found: ' + relPath, { status: 404 });
+  env.fetch = async (input: string | URL, init?: RequestInit) => {
+    const urlStr = typeof input === 'string' ? input : input.toString();
+
+    if (useLocalFolder && localFilesMap.size > 0 && urlStr.includes(LOCAL_MODEL_VIRTUAL_ID)) {
+      const marker = '/resolve/main/';
+      const markerIdx = urlStr.indexOf(marker);
+      let relPath = markerIdx >= 0 ? urlStr.slice(markerIdx + marker.length) : urlStr;
+      relPath = relPath.split('?')[0].replace(/^\/+/, '');
+
+      const matchedFile = findLocalFile(relPath);
+      if (matchedFile) {
+        return new Response(matchedFile, {
+          status: 200,
+          headers: {
+            'content-length': String(matchedFile.size),
+            'content-type': relPath.endsWith('.json')
+              ? 'application/json'
+              : 'application/octet-stream',
+          },
+        });
       }
-      return originalFetch(input, init);
-    };
-  } else {
-    env.fetch = originalFetch;
-  }
+      return new Response('Local model file not found: ' + relPath, { status: 404 });
+    }
+
+    const hostsToTry: string[] = [];
+    if (urlStr.startsWith('http://') || urlStr.startsWith('https://')) {
+      hostsToTry.push(urlStr);
+      for (const mHost of mirrorHosts) {
+        for (const oldHost of mirrorHosts) {
+          if (urlStr.startsWith(oldHost)) {
+            const subPath = urlStr.slice(oldHost.length);
+            hostsToTry.push(mHost + subPath);
+          }
+        }
+      }
+    } else {
+      hostsToTry.push(urlStr);
+    }
+
+    const uniqueUrls = Array.from(new Set(hostsToTry));
+    let lastErr: any = null;
+
+    for (const testUrl of uniqueUrls) {
+      try {
+        const resp = await originalFetch(testUrl, init);
+        if (resp.ok) {
+          return resp;
+        }
+        lastErr = new Error(`HTTP error status: ${resp.status}`);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw lastErr || new Error('Failed to fetch resource across all mirror sources.');
+  };
 }
 
 function findLocalFile(relPath: string): File | undefined {
