@@ -29,8 +29,9 @@ interface SpeechWorkspaceProps {
   onSelectJob: (id: string) => void;
   onAddFiles: (files: FileList | File[]) => void;
   onRelinkFile: (id: string, file: File) => void;
-  onStartTranscribe: (id: string) => void;
+  onStartTranscribe: (id: string, forceRestart?: boolean) => void;
   onStopTranscribe: () => void;
+  onDiscardCheckpoint: (id: string) => void;
   onRetryWithMirror: (id: string) => void;
   onRetryWithWasm: (id: string) => void;
   onUpdateText: (id: string, nextText: string) => void;
@@ -63,6 +64,7 @@ export const SpeechWorkspace: React.FC<SpeechWorkspaceProps> = ({
   onRelinkFile,
   onStartTranscribe,
   onStopTranscribe,
+  onDiscardCheckpoint,
   onRetryWithMirror,
   onRetryWithWasm,
   onUpdateText,
@@ -154,8 +156,8 @@ export const SpeechWorkspace: React.FC<SpeechWorkspaceProps> = ({
         ]
           .filter(Boolean)
           .join(activeJob.segments.length > 0 ? '\n' : '')
-      : includeTimestamps && activeJob.segments.length > 0
-        ? formatSegmentsText(activeJob.segments, activeJob.fullText, true)
+      : activeJob.segments.length > 0 && (includeTimestamps || !activeJob.fullText)
+        ? formatSegmentsText(activeJob.segments, activeJob.fullText, includeTimestamps)
         : activeJob.fullText
     : '';
 
@@ -238,9 +240,10 @@ export const SpeechWorkspace: React.FC<SpeechWorkspaceProps> = ({
                   <button
                     type="button"
                     onClick={() => onSelectJob(job.id)}
-                    className="max-w-[180px] truncate text-left"
+                    className="max-w-[200px] truncate text-left"
                   >
                     {job.fileName}
+                    {job.status === 'interrupted' ? ` · 断点 ${job.progress}%` : ''}
                   </button>
                   <button
                     type="button"
@@ -442,12 +445,42 @@ export const SpeechWorkspace: React.FC<SpeechWorkspaceProps> = ({
                       className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-red-700 whitespace-nowrap"
                     >
                       <Square className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                      <span>停止转换</span>
+                      <span>暂停并保存进度</span>
                     </button>
+                  ) : activeJob.hasCheckpoint && activeJob.status !== 'completed' ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => onStartTranscribe(activeJob.id, false)}
+                        disabled={isProcessing}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <Play className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                        <span>继续转写 ({activeJob.progress}%)</span>
+                      </button>
+                      {activeJob.file && (
+                        <button
+                          type="button"
+                          onClick={() => onStartTranscribe(activeJob.id, true)}
+                          disabled={isProcessing}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                        >
+                          <span>从头重转</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onDiscardCheckpoint(activeJob.id)}
+                        disabled={isProcessing}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+                      >
+                        <span>清除断点</span>
+                      </button>
+                    </>
                   ) : (
                     <button
                       type="button"
-                      onClick={() => onStartTranscribe(activeJob.id)}
+                      onClick={() => onStartTranscribe(activeJob.id, false)}
                       disabled={!activeJob.file || isProcessing}
                       className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 whitespace-nowrap"
                     >
@@ -489,8 +522,10 @@ export const SpeechWorkspace: React.FC<SpeechWorkspaceProps> = ({
                 </div>
               )}
 
-              {/* 3-Step Pipeline Status (visible when processing or error) */}
-              {(activeJob.status === 'processing' || activeJob.status === 'error') && (
+              {/* 3-Step Pipeline Status (visible when processing, interrupted, or error) */}
+              {(activeJob.status === 'processing' ||
+                activeJob.status === 'interrupted' ||
+                activeJob.status === 'error') && (
                 <div className="mt-4 border-t border-slate-100 pt-4 space-y-3 dark:border-slate-800">
                   <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                     {STEP_LABELS.map((stepObj, i) => {
@@ -514,25 +549,38 @@ export const SpeechWorkspace: React.FC<SpeechWorkspaceProps> = ({
                     })}
                   </div>
 
-                  {activeJob.status === 'processing' && (
+                  {(activeJob.status === 'processing' || activeJob.status === 'interrupted') && (
                     <div className="space-y-1.5">
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="font-medium text-slate-700 dark:text-slate-300">
+                      <div className="flex items-center justify-between gap-4 text-xs">
+                        <span
+                          className={`font-medium ${
+                            activeJob.status === 'interrupted'
+                              ? 'text-amber-800 dark:text-amber-300'
+                              : 'text-slate-700 dark:text-slate-300'
+                          }`}
+                        >
                           {activeJob.statusText}
                         </span>
-                        <span className="font-mono font-semibold tabular-nums text-blue-700 dark:text-blue-400">
+                        <span className="font-mono font-semibold tabular-nums text-blue-700 shrink-0 dark:text-blue-400">
                           {activeJob.progress}%
                         </span>
                       </div>
                       <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
                         <div
-                          className="h-full bg-blue-600 transition-transform duration-150"
+                          className={`h-full transition-transform duration-150 ${
+                            activeJob.status === 'interrupted' ? 'bg-amber-500' : 'bg-blue-600'
+                          }`}
                           style={{
                             width: '100%',
                             transform: `translateX(-${100 - activeJob.progress}%)`,
                           }}
                         />
                       </div>
+                      {activeJob.status === 'interrupted' && (
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          临时音频缓存仅保存在本机浏览器用于断点续传，任务完成后会自动清理释放磁盘空间。
+                        </p>
+                      )}
                     </div>
                   )}
 

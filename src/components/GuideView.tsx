@@ -163,7 +163,7 @@ export const GuideView: React.FC = () => {
           <li className="flex items-start gap-2">
             <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
             <span>
-              <strong>刷新页面后历史文件提示无法读取：</strong>浏览器重启或刷新后会回收本地文件句柄授权，点击「换个文件 / 重新选择文件」重新授权即可继续转写。
+              <strong>误刷新或关闭浏览器后能否继续转写：</strong>可以。转写过程中会自动启用防误刷提示、屏幕常亮保护，并将音频分片与已识别进度临时保存在本地 IndexedDB；重开页面后点击「继续转写」即可接着识别。任务完成后临时音频缓存会自动删除，不占硬盘空间。
             </span>
           </li>
         </ul>

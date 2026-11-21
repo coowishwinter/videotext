@@ -121,9 +121,17 @@ export interface TranscriptSegment {
   text: string;
 }
 
+export interface AudioSegmentBound {
+  startSample: number;
+  endSample: number;
+  startSec: number;
+  endSec: number;
+  isSilent: boolean;
+}
+
 export type PipelineStep = 'idle' | 'decoding' | 'loading-model' | 'transcribing' | 'done' | 'error';
 
-export type JobStatus = 'ready' | 'processing' | 'completed' | 'error' | 'cancelled';
+export type JobStatus = 'ready' | 'processing' | 'completed' | 'error' | 'cancelled' | 'interrupted';
 
 export interface TranscriptJob {
   id: string;
@@ -141,6 +149,7 @@ export interface TranscriptJob {
   segments: TranscriptSegment[];
   fullText: string;
   elapsedMs?: number;
+  elapsedMsSoFar?: number;
   deviceUsed?: 'webgpu' | 'wasm';
   detectedLanguage?: string;
   modelUsed?: string;
@@ -148,6 +157,11 @@ export interface TranscriptJob {
   createdAt: number;
   completedAt?: number;
   isHistoryOnly?: boolean;
+  hasCheckpoint?: boolean;
+  checkpointDoneSegments?: number;
+  checkpointTotalSegments?: number;
+  checkpointModelId?: WhisperModelId;
+  checkpointLanguage?: string;
 }
 
 export interface ModelCacheInfo {

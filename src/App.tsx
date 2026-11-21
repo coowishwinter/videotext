@@ -22,10 +22,16 @@ import {
 } from './utils/audioDecoder';
 import {
   clearModelCache,
+  deleteCheckpointFromDB,
   deleteTranscriptFromDB,
   inspectModelCaches,
+  loadCheckpointAudioData,
+  loadCheckpointsFromDB,
   loadTranscriptsFromDB,
+  saveCheckpointAudioAndMeta,
   saveTranscriptToDB,
+  updateCheckpointProgress,
+  updateCheckpointStartMeta,
 } from './utils/storage';
 import {
   convertToSimplifiedChinese,
@@ -39,7 +45,7 @@ const DEFAULT_CONFIG: SpeechConfig = {
   modelId: 'Xenova/whisper-base',
   device: 'auto',
   language: 'zh-hans',
-  downloadSource: 'huggingface',
+  downloadSource: 'auto-fallback',
   customMirrorUrl: 'https://hf-mirror.com/',
   offlineOnly: false,
   localModelName: null,
@@ -105,14 +111,20 @@ export default function App() {
   const configRef = useRef<SpeechConfig>(config);
   const localModelFilesRef = useRef<{ name: string; files: WorkerLocalFileEntry[] } | null>(null);
   const globalFilePickerRef = useRef<HTMLInputElement>(null);
-  const wakeLockRef = useRef<any>(null);
+  const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
+  const activeTaskTimingRef = useRef<{
+    jobId: string;
+    startedAt: number;
+    baseElapsedMs: number;
+  } | null>(null);
+  const checkpointSaveChainRef = useRef<Promise<void>>(Promise.resolve());
 
   // 1. 禁止刷新/关闭页面提示 (Prevent refresh or tab close during processing)
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (isProcessing) {
         e.preventDefault();
-        e.returnValue = '正在进行本地语音转文字，关闭或刷新页面将中断转写并丢失进度。确定要离开吗？';
+        e.returnValue = '正在进行本地语音转文字，关闭或刷新页面将中断转写（已保存断点进度，重开可继续）。确定要离开吗？';
         return e.returnValue;
       }
     };
@@ -122,28 +134,48 @@ export default function App() {
     };
   }, [isProcessing]);
 
-  // 2. 保持浏览器活跃 (Keep browser active via Screen Wake Lock API)
+  // 2. 保持浏览器活跃 (Keep browser active via Screen Wake Lock API, re-acquire on visibility return)
   useEffect(() => {
-    let sentinel: any = null;
-    if (isProcessing) {
+    let cancelled = false;
+
+    const requestLock = () => {
+      if (!isProcessing || cancelled) return;
       if (typeof navigator !== 'undefined' && 'wakeLock' in navigator) {
-        (navigator.wakeLock as any)
-          .request('screen')
-          .then((lock: any) => {
-            sentinel = lock;
+        const nav = navigator as unknown as {
+          wakeLock?: { request: (type: 'screen') => Promise<{ release: () => Promise<void> }> };
+        };
+        nav.wakeLock
+          ?.request('screen')
+          .then((lock) => {
+            if (cancelled) {
+              lock.release().catch(() => {});
+              return;
+            }
             wakeLockRef.current = lock;
           })
           .catch(() => {
-            // Wake lock denied or not supported
+            // Wake lock denied or unsupported
           });
       }
-    } else {
-      if (wakeLockRef.current) {
-        wakeLockRef.current.release().catch(() => {});
-        wakeLockRef.current = null;
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && isProcessing && !wakeLockRef.current) {
+        requestLock();
       }
+    };
+
+    if (isProcessing) {
+      requestLock();
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    } else if (wakeLockRef.current) {
+      wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
     }
+
     return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (wakeLockRef.current) {
         wakeLockRef.current.release().catch(() => {});
         wakeLockRef.current = null;
@@ -287,7 +319,47 @@ export default function App() {
         return;
       }
 
+      if (msg.type === 'transcribe-started') {
+        checkpointSaveChainRef.current = checkpointSaveChainRef.current.then(() =>
+          updateCheckpointStartMeta(
+            msg.taskId,
+            msg.totalSegments,
+            msg.segmentBounds,
+            msg.detectedLanguage
+          )
+        );
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === msg.taskId
+              ? {
+                  ...j,
+                  checkpointTotalSegments: msg.totalSegments,
+                  detectedLanguage: msg.detectedLanguage ?? j.detectedLanguage,
+                }
+              : j
+          )
+        );
+        return;
+      }
+
       if (msg.type === 'transcribe-progress') {
+        if (msg.segmentCompleted) {
+          const timing = activeTaskTimingRef.current;
+          const elapsedSoFar =
+            timing && timing.jobId === msg.taskId
+              ? timing.baseElapsedMs + Math.round(performance.now() - timing.startedAt)
+              : 0;
+          checkpointSaveChainRef.current = checkpointSaveChainRef.current.then(() =>
+            updateCheckpointProgress(
+              msg.taskId,
+              msg.segmentIndex,
+              msg.segments,
+              msg.detectedLanguage,
+              elapsedSoFar
+            )
+          );
+        }
+
         setJobs((prev) =>
           prev.map((j) => {
             if (j.id !== msg.taskId) return j;
@@ -301,6 +373,10 @@ export default function App() {
               liveText: msg.liveText,
               segments: msg.segments,
               detectedLanguage: msg.detectedLanguage ?? j.detectedLanguage,
+              checkpointDoneSegments: msg.segmentCompleted
+                ? msg.segmentIndex
+                : j.checkpointDoneSegments,
+              checkpointTotalSegments: msg.totalSegments,
             };
           })
         );
@@ -347,12 +423,21 @@ export default function App() {
   useEffect(() => {
     const w = initWorker();
     refreshCacheStatus();
-    loadTranscriptsFromDB().then((history) => {
-      if (history.length > 0) {
-        setJobs((prev) => (prev.length === 0 ? history : [...prev, ...history]));
-        setActiveJobId((prev) => prev ?? history[0].id);
+    Promise.all([loadCheckpointsFromDB(), loadTranscriptsFromDB()]).then(
+      ([checkpoints, history]) => {
+        const merged = [...checkpoints, ...history];
+        if (merged.length > 0) {
+          setJobs((prev) => (prev.length === 0 ? merged : [...prev, ...merged]));
+          setActiveJobId((prev) => prev ?? merged[0].id);
+        }
+        if (checkpoints.length > 0) {
+          setBanner({
+            type: 'info',
+            message: `检测到 ${checkpoints.length} 个未完成的本地转写任务，已自动恢复断点进度；点击「继续转写」即可接着识别（完成后自动释放临时缓存）。`,
+          });
+        }
       }
-    });
+    );
     return () => {
       w.terminate();
     };
@@ -435,9 +520,12 @@ export default function App() {
   }, []);
 
   const runTranscribeJob = useCallback(
-    async (jobId: string, overrideCfg?: SpeechConfig) => {
+    async (jobId: string, overrideCfg?: SpeechConfig, options?: { forceRestart?: boolean }) => {
       const target = jobsRef.current.find((j) => j.id === jobId);
-      if (!target || !target.file || !workerRef.current || isProcessing) return;
+      const canUseCheckpoint = Boolean(target?.hasCheckpoint && !options?.forceRestart);
+      if (!target || (!target.file && !canUseCheckpoint) || !workerRef.current || isProcessing) {
+        return;
+      }
 
       const cfg = overrideCfg ?? configRef.current;
 
@@ -470,9 +558,11 @@ export default function App() {
             ? {
                 ...j,
                 status: 'processing',
-                step: 'decoding',
-                progress: 4,
-                statusText: '正在本地提取并重采样 16kHz 音轨...',
+                step: canUseCheckpoint ? 'loading-model' : 'decoding',
+                progress: canUseCheckpoint ? Math.max(8, j.progress) : 4,
+                statusText: canUseCheckpoint
+                  ? '正在从本地断点恢复音频缓存...'
+                  : '正在本地提取并重采样 16kHz 音轨...',
                 liveText: '',
                 errorDetail: undefined,
               }
@@ -480,12 +570,66 @@ export default function App() {
         )
       );
 
-      let failedStep: 'decoding' | 'loading-model' | 'transcribing' = 'decoding';
+      let failedStep: 'decoding' | 'loading-model' | 'transcribing' = canUseCheckpoint
+        ? 'loading-model'
+        : 'decoding';
 
       try {
-        const { audioData, duration } = await decodeMediaTo16kMono(
-          target.file,
-          (pct, detail) => {
+        let audioData: Float32Array;
+        let duration = target.duration;
+        let startSegmentIndex = 0;
+        let initialSegments: TranscriptSegment[] = [];
+        let segmentBounds: import('./types/speech').AudioSegmentBound[] | undefined;
+        let initialDetectedLanguage: string | undefined;
+        let baseElapsedMs = 0;
+        let hasCheckpoint = false;
+
+        if (canUseCheckpoint) {
+          const loaded = await loadCheckpointAudioData(jobId);
+          if (loaded) {
+            audioData = loaded.audioData;
+            duration = loaded.duration || duration;
+            startSegmentIndex = loaded.nextSegmentIndex;
+            initialSegments = loaded.segments;
+            segmentBounds = loaded.segmentBounds.length > 0 ? loaded.segmentBounds : undefined;
+            initialDetectedLanguage = loaded.detectedLanguage;
+            baseElapsedMs = loaded.elapsedMsSoFar;
+            hasCheckpoint = true;
+          } else if (target.file) {
+            // Checkpoint chunks missing; transparently re-decode from source file
+            failedStep = 'decoding';
+            const decoded = await decodeMediaTo16kMono(target.file, (pct, detail) => {
+              if (stopRequestedRef.current) return;
+              setJobs((prev) =>
+                prev.map((j) =>
+                  j.id === jobId && j.status === 'processing' && j.step === 'decoding'
+                    ? {
+                        ...j,
+                        progress: Math.max(2, Math.min(9, Math.round(pct * 0.09))),
+                        statusText: detail,
+                      }
+                    : j
+                )
+              );
+            });
+            audioData = decoded.audioData;
+            duration = decoded.duration;
+            hasCheckpoint = await saveCheckpointAudioAndMeta(
+              { ...target, duration },
+              audioData,
+              cfg.modelId,
+              cfg.language
+            );
+          } else {
+            throw new Error(
+              '本地断点音频缓存已被浏览器清理或失效，请点击「重新选择文件」再次导入原媒体文件。'
+            );
+          }
+        } else {
+          if (options?.forceRestart) {
+            await deleteCheckpointFromDB(jobId);
+          }
+          const decoded = await decodeMediaTo16kMono(target.file!, (pct, detail) => {
             if (stopRequestedRef.current) return;
             setJobs((prev) =>
               prev.map((j) =>
@@ -498,10 +642,35 @@ export default function App() {
                   : j
               )
             );
-          }
-        );
+          });
+          if (stopRequestedRef.current) return;
+          audioData = decoded.audioData;
+          duration = decoded.duration;
+
+          setJobs((prev) =>
+            prev.map((j) =>
+              j.id === jobId
+                ? {
+                    ...j,
+                    duration: duration || j.duration,
+                    progress: 9,
+                    statusText: '正在保存本地断点缓存以防误刷新中断...',
+                  }
+                : j
+            )
+          );
+
+          hasCheckpoint = await saveCheckpointAudioAndMeta(
+            { ...target, duration },
+            audioData,
+            cfg.modelId,
+            cfg.language
+          );
+        }
+
         if (stopRequestedRef.current) return;
 
+        activeTaskTimingRef.current = { jobId, startedAt, baseElapsedMs };
         failedStep = 'loading-model';
         setJobs((prev) =>
           prev.map((j) =>
@@ -510,8 +679,12 @@ export default function App() {
                   ...j,
                   duration: duration || j.duration,
                   step: 'loading-model',
-                  progress: 10,
-                  statusText: '正在载入本地 Whisper 模型...',
+                  progress: Math.max(10, j.progress),
+                  statusText:
+                    startSegmentIndex > 0
+                      ? `正在载入本地 Whisper 模型（将从第 ${startSegmentIndex + 1} 段继续）...`
+                      : '正在载入本地 Whisper 模型...',
+                  hasCheckpoint,
                 }
               : j
           )
@@ -538,12 +711,17 @@ export default function App() {
               remoteHost: resolveRemoteHost(cfg),
               offlineOnly: cfg.offlineOnly,
               useLocalFolderModel: Boolean(cfg.localModelName),
+              startSegmentIndex,
+              initialSegments,
+              segmentBounds,
+              initialDetectedLanguage,
             },
             [audioData.buffer]
           );
         });
 
-        const elapsedMs = Math.round(performance.now() - startedAt);
+        await checkpointSaveChainRef.current;
+        const elapsedMs = baseElapsedMs + Math.round(performance.now() - startedAt);
         const completedAt = Date.now();
         const finalText = result.text || formatSegmentsText(result.segments, '', false);
 
@@ -557,15 +735,19 @@ export default function App() {
               status: 'completed',
               step: 'done',
               progress: 100,
-              statusText: '已完成',
+              statusText: '已完成（临时断点缓存已自动清理）',
               liveText: '',
               segments: result.segments,
               fullText: finalText,
               elapsedMs,
+              elapsedMsSoFar: undefined,
               deviceUsed: result.deviceUsed,
               detectedLanguage: result.detectedLanguage,
               modelUsed: cfg.localModelName || cfg.modelId,
               completedAt,
+              hasCheckpoint: false,
+              checkpointDoneSegments: undefined,
+              checkpointTotalSegments: undefined,
             };
             return completedSnapshot;
           })
@@ -574,6 +756,8 @@ export default function App() {
         if (completedSnapshot) {
           await saveTranscriptToDB(completedSnapshot);
         }
+        // 转换完成后自动删除硬盘中的临时断点音频缓存
+        await deleteCheckpointFromDB(jobId);
       } catch (err) {
         if (stopRequestedRef.current) return;
         const raw = err instanceof Error ? err.message : String(err);
@@ -584,7 +768,7 @@ export default function App() {
           raw.includes('404') ||
           raw.includes('Could not locate file')
         ) {
-          friendly = `模型文件下载或定位失败（${raw}）。建议点击下方「改用国内镜像 (hf-mirror.com) 重试」。`;
+          friendly = `模型文件下载或定位失败（${raw}）。建议点击下方「改用智能多镜像重试」。`;
           failedStep = 'loading-model';
         }
 
@@ -595,7 +779,7 @@ export default function App() {
                   ...j,
                   status: 'error',
                   step: failedStep,
-                  progress: 0,
+                  progress: j.hasCheckpoint ? j.progress : 0,
                   statusText:
                     failedStep === 'decoding'
                       ? '音频提取失败'
@@ -608,6 +792,9 @@ export default function App() {
           )
         );
       } finally {
+        if (activeTaskTimingRef.current?.jobId === jobId) {
+          activeTaskTimingRef.current = null;
+        }
         setIsProcessing(false);
       }
     },
@@ -617,25 +804,33 @@ export default function App() {
   const handleStopTranscribe = useCallback(() => {
     stopRequestedRef.current = true;
     for (const [, pending] of pendingTasksRef.current.entries()) {
-      pending.reject(new Error('已手动停止'));
+      pending.reject(new Error('已手动暂停'));
     }
     pendingTasksRef.current.clear();
     initWorker();
 
     setJobs((prev) =>
-      prev.map((j) =>
-        j.status === 'processing'
-          ? {
-              ...j,
-              status: 'cancelled',
-              step: 'idle',
-              progress: 0,
-              statusText: '已停止',
-              liveText: '',
-            }
-          : j
-      )
+      prev.map((j) => {
+        if (j.status !== 'processing') return j;
+        const canResume = Boolean(j.hasCheckpoint);
+        const doneSegs = j.checkpointDoneSegments ?? 0;
+        const totalSegs = j.checkpointTotalSegments ?? 0;
+        return {
+          ...j,
+          status: canResume ? 'interrupted' : 'cancelled',
+          step: canResume && totalSegs > 0 ? 'transcribing' : 'idle',
+          progress: canResume ? j.progress : 0,
+          statusText:
+            canResume && totalSegs > 0
+              ? `已暂停于第 ${doneSegs}/${totalSegs} 段，可点击「继续转写」`
+              : canResume
+                ? '已暂停，已保留本地断点缓存，可点击「继续转写」'
+                : '已停止',
+          liveText: '',
+        };
+      })
     );
+    activeTaskTimingRef.current = null;
     setIsProcessing(false);
   }, [initWorker]);
 
@@ -712,6 +907,30 @@ export default function App() {
       return next;
     });
     deleteTranscriptFromDB(id);
+    deleteCheckpointFromDB(id);
+  }, []);
+
+  const handleDiscardCheckpoint = useCallback(async (id: string) => {
+    await deleteCheckpointFromDB(id);
+    setJobs((prev) =>
+      prev.map((j) =>
+        j.id === id
+          ? {
+              ...j,
+              status: j.file ? 'ready' : 'cancelled',
+              step: 'idle',
+              progress: 0,
+              statusText: j.file ? '准备就绪（已清除断点）' : '已清除断点缓存',
+              segments: [],
+              fullText: '',
+              hasCheckpoint: false,
+              checkpointDoneSegments: undefined,
+              checkpointTotalSegments: undefined,
+              elapsedMsSoFar: undefined,
+            }
+          : j
+      )
+    );
   }, []);
 
   const handlePreloadModel = useCallback(
@@ -812,9 +1031,11 @@ export default function App() {
       {isProcessing && (
         <div
           role="alert"
-          className="sticky top-0 z-40 flex items-center justify-center gap-2 bg-amber-600 px-4 py-2.5 text-xs font-semibold text-white shadow-md animate-pulse"
+          className="sticky top-0 z-40 flex items-center justify-center gap-2 bg-amber-600 px-4 py-2 text-xs font-semibold text-white shadow-sm"
         >
-          <span>⚠️ 正在进行本地语音转写：请勿关闭、刷新浏览器或切换到后台标签页（已启用屏幕常亮防休眠保持活跃）。</span>
+          <span>
+            正在进行本地语音转写：请勿关闭或刷新浏览器（已启用屏幕常亮防休眠，并同步保存断点以防意外中断）。
+          </span>
         </div>
       )}
 
@@ -889,8 +1110,11 @@ export default function App() {
             onSelectJob={setActiveJobId}
             onAddFiles={handleAddFiles}
             onRelinkFile={handleRelinkFile}
-            onStartTranscribe={(id) => runTranscribeJob(id)}
+            onStartTranscribe={(id, forceRestart) =>
+              runTranscribeJob(id, undefined, { forceRestart })
+            }
             onStopTranscribe={handleStopTranscribe}
+            onDiscardCheckpoint={handleDiscardCheckpoint}
             onRetryWithMirror={handleRetryWithMirror}
             onRetryWithWasm={handleRetryWithWasm}
             onUpdateText={handleUpdateText}

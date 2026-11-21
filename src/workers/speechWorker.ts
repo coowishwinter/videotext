@@ -1,7 +1,7 @@
 import { TextStreamer, env, pipeline } from '@huggingface/transformers';
 import * as OpenCC_T2CN from 'opencc-js/t2cn';
 import * as OpenCC_CN2T from 'opencc-js/cn2t';
-import { MODEL_OPTIONS } from '../types/speech';
+import { AudioSegmentBound, MODEL_OPTIONS, TranscriptSegment } from '../types/speech';
 
 const toSimplified = OpenCC_T2CN.Converter({ from: 't', to: 'cn' });
 const toTraditional = OpenCC_CN2T.Converter({ from: 'cn', to: 't' });
@@ -41,6 +41,10 @@ export type SpeechWorkerIncoming =
       remoteHost: string;
       offlineOnly: boolean;
       useLocalFolderModel: boolean;
+      startSegmentIndex?: number;
+      initialSegments?: TranscriptSegment[];
+      segmentBounds?: AudioSegmentBound[];
+      initialDetectedLanguage?: string;
     };
 
 export type SpeechWorkerOutgoing =
@@ -73,20 +77,28 @@ export type SpeechWorkerOutgoing =
       error: string;
     }
   | {
+      type: 'transcribe-started';
+      taskId: string;
+      totalSegments: number;
+      segmentBounds: AudioSegmentBound[];
+      detectedLanguage?: string;
+    }
+  | {
       type: 'transcribe-progress';
       taskId: string;
       progress: number;
       segmentIndex: number;
       totalSegments: number;
       liveText: string;
-      segments: Array<{ id: string; startSec: number; endSec: number; text: string }>;
+      segments: TranscriptSegment[];
       detectedLanguage?: string;
+      segmentCompleted?: boolean;
     }
   | {
       type: 'transcribe-result';
       taskId: string;
       text: string;
-      segments: Array<{ id: string; startSec: number; endSec: number; text: string }>;
+      segments: TranscriptSegment[];
       deviceUsed: 'webgpu' | 'wasm';
       detectedLanguage?: string;
     }
@@ -564,15 +576,27 @@ self.onmessage = async (event: MessageEvent<SpeechWorkerIncoming>) => {
       } satisfies SpeechWorkerOutgoing);
 
       const samplingRate = 16000;
-      const segments = splitAudioSegments(msg.audioData, samplingRate);
+      const segments =
+        msg.segmentBounds && msg.segmentBounds.length > 0
+          ? msg.segmentBounds
+          : splitAudioSegments(msg.audioData, samplingRate);
       const totalSegments = segments.length;
 
-      let langCode = LANGUAGE_NAME_TO_SHORT[msg.language] ?? msg.language;
-      if (!msg.language || msg.language === 'auto') {
+      let langCode =
+        msg.initialDetectedLanguage || (LANGUAGE_NAME_TO_SHORT[msg.language] ?? msg.language);
+      if (!msg.initialDetectedLanguage && (!msg.language || msg.language === 'auto')) {
         const firstActive = segments.find((s) => !s.isSilent) ?? segments[0];
         const sampleSlice = msg.audioData.subarray(firstActive.startSample, firstActive.endSample);
         langCode = await detectLanguageCode(pipe, sampleSlice);
       }
+
+      self.postMessage({
+        type: 'transcribe-started',
+        taskId: msg.taskId,
+        totalSegments,
+        segmentBounds: segments,
+        detectedLanguage: langCode,
+      } satisfies SpeechWorkerOutgoing);
 
       const targetScript: 'hans' | 'hant' | 'raw' =
         msg.language === 'zh-hans' || (msg.language === 'auto' && langCode === 'zh')
@@ -581,14 +605,12 @@ self.onmessage = async (event: MessageEvent<SpeechWorkerIncoming>) => {
             ? 'hant'
             : 'raw';
 
-      const recognizedSegments: Array<{
-        id: string;
-        startSec: number;
-        endSec: number;
-        text: string;
-      }> = [];
+      const recognizedSegments: TranscriptSegment[] = msg.initialSegments
+        ? [...msg.initialSegments]
+        : [];
+      const startIdx = Math.max(0, Math.min(totalSegments, msg.startSegmentIndex ?? 0));
 
-      for (let idx = 0; idx < totalSegments; idx++) {
+      for (let idx = startIdx; idx < totalSegments; idx++) {
         const seg = segments[idx];
         const segDuration = (seg.endSample - seg.startSample) / samplingRate;
 
@@ -619,6 +641,7 @@ self.onmessage = async (event: MessageEvent<SpeechWorkerIncoming>) => {
                     liveText: liveClean,
                     segments: recognizedSegments,
                     detectedLanguage: langCode,
+                    segmentCompleted: false,
                   } satisfies SpeechWorkerOutgoing);
                 }
               },
@@ -687,6 +710,7 @@ self.onmessage = async (event: MessageEvent<SpeechWorkerIncoming>) => {
           liveText: '',
           segments: recognizedSegments,
           detectedLanguage: langCode,
+          segmentCompleted: true,
         } satisfies SpeechWorkerOutgoing);
       }
 
