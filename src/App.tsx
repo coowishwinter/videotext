@@ -105,6 +105,51 @@ export default function App() {
   const configRef = useRef<SpeechConfig>(config);
   const localModelFilesRef = useRef<{ name: string; files: WorkerLocalFileEntry[] } | null>(null);
   const globalFilePickerRef = useRef<HTMLInputElement>(null);
+  const wakeLockRef = useRef<any>(null);
+
+  // 1. 禁止刷新/关闭页面提示 (Prevent refresh or tab close during processing)
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (isProcessing) {
+        e.preventDefault();
+        e.returnValue = '正在进行本地语音转文字，关闭或刷新页面将中断转写并丢失进度。确定要离开吗？';
+        return e.returnValue;
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [isProcessing]);
+
+  // 2. 保持浏览器活跃 (Keep browser active via Screen Wake Lock API)
+  useEffect(() => {
+    let sentinel: any = null;
+    if (isProcessing) {
+      if (typeof navigator !== 'undefined' && 'wakeLock' in navigator) {
+        (navigator.wakeLock as any)
+          .request('screen')
+          .then((lock: any) => {
+            sentinel = lock;
+            wakeLockRef.current = lock;
+          })
+          .catch(() => {
+            // Wake lock denied or not supported
+          });
+      }
+    } else {
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release().catch(() => {});
+        wakeLockRef.current = null;
+      }
+    }
+    return () => {
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release().catch(() => {});
+        wakeLockRef.current = null;
+      }
+    };
+  }, [isProcessing]);
 
   const pendingTasksRef = useRef<
     Map<
@@ -763,6 +808,15 @@ export default function App() {
         onSelectTab={setActiveTab}
         onOpenFilePicker={() => globalFilePickerRef.current?.click()}
       />
+
+      {isProcessing && (
+        <div
+          role="alert"
+          className="sticky top-0 z-40 flex items-center justify-center gap-2 bg-amber-600 px-4 py-2.5 text-xs font-semibold text-white shadow-md animate-pulse"
+        >
+          <span>⚠️ 正在进行本地语音转写：请勿关闭、刷新浏览器或切换到后台标签页（已启用屏幕常亮防休眠保持活跃）。</span>
+        </div>
+      )}
 
       {/* Mobile Navigation */}
       <nav
